@@ -488,14 +488,11 @@ fn set_share_env(sharun_dir: &str, mesa_share: Option<&str>) {
 							} else {
 								// host icds are only used as fallback, they are
 								// disabled entirely with SHARUN_ALLOW_SYS_VKICD=0.
-								// nouveau and lavapipe (swrast) are not bundled
-								// by default, use the host ones unless they were
-								// bundled explicitly
+								// nouveau is not bundled by default, use the host
+								// one unless it was bundled explicitly. lavapipe
+								// is deliberately not exposed from the host.
 								let use_host_icds = sys_vkicd != "0";
 								let bundled_icds = collect_json_files(&graphics_share.join(vk_dir));
-								let has_lvp = bundled_icds.iter().any(|p| {
-									p.file_name().unwrap_or_default().to_string_lossy().contains("lvp")
-								});
 								let has_nouveau = bundled_icds.iter().any(|p| {
 									p.file_name().unwrap_or_default().to_string_lossy().contains("nouveau")
 								});
@@ -510,7 +507,6 @@ fn set_share_env(sharun_dir: &str, mesa_share: Option<&str>) {
 												let name = entry.file_name().to_string_lossy().to_string();
 												if use_host_icds && is_file(&path) &&
 													(name.contains("nvidia") ||
-													(!has_lvp && name.contains("lvp")) ||
 													(!has_nouveau && name.contains("nouveau"))) {
 													add_to_env(vk_env, path)
 												}

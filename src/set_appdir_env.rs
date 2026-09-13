@@ -481,13 +481,17 @@ fn set_share_env(sharun_dir: &str, mesa_share: Option<&str>) {
 						"vulkan" => {
 							let vk_dir = "vulkan/icd.d";
 							let vk_env = "VK_DRIVER_FILES";
-							if get_env_var("SHARUN_ALLOW_SYS_VKICD") == "1" {
+							let sys_vkicd = get_env_var("SHARUN_ALLOW_SYS_VKICD");
+							if sys_vkicd == "1" {
 								env::remove_var("SHARUN_ALLOW_SYS_VKICD");
 								add_to_xdg_data_env(xdg_data_dirs, vk_env, vk_dir)
 							} else {
+								// host icds are only used as fallback, they are
+								// disabled entirely with SHARUN_ALLOW_SYS_VKICD=0.
 								// nouveau and lavapipe (swrast) are not bundled
-								// by default, load them from the host instead
-								// unless they were explicitly bundled
+								// by default, use the host ones unless they were
+								// bundled explicitly
+								let use_host_icds = sys_vkicd != "0";
 								let bundled_icds = collect_json_files(&graphics_share.join(vk_dir));
 								let has_lvp = bundled_icds.iter().any(|p| {
 									p.file_name().unwrap_or_default().to_string_lossy().contains("lvp")
@@ -504,7 +508,7 @@ fn set_share_env(sharun_dir: &str, mesa_share: Option<&str>) {
 											for entry in dir.flatten() {
 												let path = entry.path();
 												let name = entry.file_name().to_string_lossy().to_string();
-												if is_file(&path) &&
+												if use_host_icds && is_file(&path) &&
 													(name.contains("nvidia") ||
 													(!has_lvp && name.contains("lvp")) ||
 													(!has_nouveau && name.contains("nouveau"))) {

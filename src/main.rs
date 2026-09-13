@@ -36,6 +36,7 @@ fn print_usage() {
 [ Environments ]:
 	SHARUN_WORKING_DIR=/path       Specifies the path to the working directory
 	SHARUN_ALLOW_SYS_VKICD=1       Enables breaking system vulkan/icd.d for vulkan loader
+	                               Set to 0 to only use the bundled vulkan icds
 	SHARUN_ALLOW_LD_PRELOAD=1      Enables breaking LD_PRELOAD env variable
 	SHARUN_ALLOW_QT_PLUGIN_PATH=1  Enables breaking QT_PLUGIN_PATH env variable
 	SHARUN_NO_NVIDIA_EGL_PRIME=1   Disables NVIDIA EGL prime logic

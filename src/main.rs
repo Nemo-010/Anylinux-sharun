@@ -242,7 +242,7 @@ fn main() {
 	let interpreter = if is_static_bin {
 		PathBuf::new()
 	} else {
-		get_interpreter(&library_path).unwrap_or_else(|_|{
+		get_interpreter(&library_path, is_elf32_bin).unwrap_or_else(|_|{
 			eprintln!("Interpreter not found!");
 			exit(1)
 		})

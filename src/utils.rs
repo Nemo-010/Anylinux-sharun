@@ -14,7 +14,7 @@ use nix::unistd::{access, AccessFlags};
 use goblin::elf::Elf;
 
 
-pub fn get_interpreter(library_path: &str) -> Result<PathBuf> {
+pub fn get_interpreter(library_path: &str, is_elf32: bool) -> Result<PathBuf> {
 	let mut interpreters = Vec::new();
 	if let Ok(ldname) = env::var("SHARUN_LDNAME") {
 		if !ldname.is_empty() {
@@ -22,11 +22,14 @@ pub fn get_interpreter(library_path: &str) -> Result<PathBuf> {
 		}
 	} else {
 		#[cfg(target_arch = "x86_64")]          // target x86_64-unknown-linux-musl
-		interpreters.append(&mut vec![
-			"ld-linux-x86-64.so.2".into(),
-			"ld-musl-x86_64.so.1".into(),
-			"ld-linux.so.2".into()
-		]);
+		if is_elf32 {
+			interpreters.append(&mut vec!["ld-linux.so.2".into()]);
+		} else {
+			interpreters.append(&mut vec![
+				"ld-linux-x86-64.so.2".into(),
+				"ld-musl-x86_64.so.1".into()
+			]);
+		}
 		#[cfg(target_arch = "aarch64")]         // target aarch64-unknown-linux-musl
 		interpreters.append(&mut vec![
 			"ld-linux-aarch64.so.1".into(),

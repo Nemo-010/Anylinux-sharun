@@ -47,6 +47,32 @@ fn debug() -> bool {
 	matches!(env::var(ENV_DEBUG), Ok(v) if v == "1")
 }
 
+/// Probe once whether the kernel implements ppoll(2). A zero timeout is used so
+/// the probe can never block: a working `ppoll(NULL, 0, {0,0}, NULL, 0)` returns
+/// 0 immediately. Ubuntu 6.10's 2.6.17 answers ENOSYS, and some old kernels
+/// answer unimplemented syscalls with the syscall number itself, so both count
+/// as missing. Only then is ppoll rewritten to poll; kernels that have it are
+/// left untouched.
+fn ppoll_missing() -> bool {
+	static MISSING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*MISSING.get_or_init(|| {
+		let ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+		let rc = unsafe {
+			libc::syscall(
+				libc::SYS_ppoll,
+				std::ptr::null::<libc::pollfd>(),
+				0usize,
+				&ts as *const libc::timespec,
+				std::ptr::null::<libc::sigset_t>(),
+				0usize,
+			)
+		};
+		rc == libc::SYS_ppoll
+			|| (rc == -1
+				&& std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS))
+	})
+}
+
 fn kernel_lt(want_major: u64, want_minor: u64, want_patch: u64) -> bool {
 	let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
 	if unsafe { libc::uname(&mut uts) } != 0 {
@@ -196,9 +222,10 @@ fn install_seccomp_filter() -> bool {
 		jump(AUDIT_ARCH_X86_64, 1, 0),
 		stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW),
 		stmt(BPF_LD_W_ABS, 0), // seccomp_data.nr
-		jump(libc::SYS_futex as u32, 2, 0),
-		jump(libc::SYS_pipe2 as u32, 1, 0),
-		jump(libc::SYS_statx as u32, 0, 1),
+		jump(libc::SYS_futex as u32, 3, 0),
+		jump(libc::SYS_pipe2 as u32, 2, 0),
+		jump(libc::SYS_statx as u32, 1, 0),
+		jump(libc::SYS_getrandom as u32, 0, 1),
 		stmt(BPF_RET_K, libc::SECCOMP_RET_TRACE),
 		stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW),
 	];
@@ -415,6 +442,11 @@ impl Tracer {
 		} else if regs.orig_rax == libc::SYS_statx as u64 {
 			self.setup_statx(pid, regs);
 			true
+		} else if regs.orig_rax == libc::SYS_getrandom as u64 {
+			// Need the exit stop to fill the buffer when the kernel lacks
+			// getrandom (3.17).
+			self.last_syscall.insert(pid, regs.orig_rax);
+			true
 		} else {
 			false
 		}
@@ -446,6 +478,32 @@ impl Tracer {
 				}
 			} else if regs.orig_rax == libc::SYS_statx as u64 {
 				self.setup_statx(pid, regs);
+			} else if regs.orig_rax == libc::SYS_ppoll as u64 && ppoll_missing() {
+				// ppoll -> poll, dropping the signal mask. Kernels that lack
+				// ppoll make GLib's main loop spin on the ENOSYS.
+				let ts = regs.rdx;
+				let ms: i32 = if ts == 0 {
+					-1
+				} else {
+					match read_struct(pid, ts, 16) {
+						Some(b) => {
+							let sec = i64::from_le_bytes(b[0..8].try_into().unwrap_or_default());
+							let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap_or_default());
+							sec.saturating_mul(1000)
+								.saturating_add(nsec / 1_000_000)
+								.clamp(-1, i32::MAX as i64) as i32
+						},
+						None => -1,
+					}
+				};
+				let mut patched = regs;
+				patched.rdx = ms as i64 as u64;
+				patched.orig_rax = libc::SYS_poll as u64;
+				patched.rax = libc::SYS_poll as u64;
+				let _ = ptrace::setregs(pid, patched);
+				if debug() {
+					eprintln!("kernel-compat: ppoll -> poll (timeout {ms}ms)");
+				}
 			}
 		} else {
 			self.on_syscall_exit(pid);
@@ -487,6 +545,61 @@ impl Tracer {
 			regs.rsp = saved_rsp;
 			dirty = true;
 		}
+		// getrandom (3.17): always fill the buffer ourselves. Rust std (and thus
+		// any HashMap/HashSet) does not cope with what old kernels return here
+		// and panics with "range start index 318 out of range for slice of
+		// length 16", so we synthesize it regardless of the syscall's result.
+		let getrandom_nr = libc::SYS_getrandom as u64;
+		if self.last_syscall.get(&pid).copied() == Some(getrandom_nr) {
+			if emulate_getrandom(pid, regs.rdi, regs.rsi as usize) {
+				if debug() {
+					eprintln!(
+						"kernel-compat: getrandom emulated ({} bytes at {:#x})",
+						regs.rsi,
+						regs.rdi
+					);
+				}
+				regs.rax = regs.rsi;
+				dirty = true;
+			} else if regs.rax == getrandom_nr {
+				// Emulation failed and the kernel answered with its own number:
+				// report ENOSYS so callers fall back to /dev/urandom instead of
+				// treating the syscall number as a success.
+				regs.rax = (-(libc::ENOSYS as i64)) as u64;
+				dirty = true;
+			}
+		}
+		// Syscalls newer than these kernels must fail with ENOSYS so callers
+		// take their fallback path. Some kernels have been observed returning
+		// the syscall number itself (e.g. clone3 -> 435), which makes glibc
+		// think it succeeded; normalize to ENOSYS.
+		if let Some(nr) = self.last_syscall.get(&pid).copied() {
+			const FORCE_ENOSYS: [u64; 14] = [
+				282, // signalfd (2.6.22)
+				283, // timerfd_create (2.6.25)
+				284, // eventfd (2.6.22)
+				288, // accept4 (2.6.28)
+				289, // signalfd4 (2.6.27)
+				290, // eventfd2 (2.6.27)
+				291, // epoll_create1 (2.6.27)
+				292, // dup3 (2.6.27)
+				294, // inotify_init1 (2.6.27)
+				302, // prlimit64 (2.6.36)
+				334, // rseq (4.18)
+				435, // clone3 (5.3)
+				437, // openat2 (5.6)
+				439, // faccessat2 (5.8)
+			];
+			if FORCE_ENOSYS.contains(&nr) && regs.rax == nr {
+				if debug() {
+					eprintln!(
+						"kernel-compat: syscall {nr} returned its own number; forcing ENOSYS"
+					);
+				}
+				regs.rax = (-(libc::ENOSYS as i64)) as u64;
+				dirty = true;
+			}
+		}
 		if dirty {
 			let _ = ptrace::setregs(pid, regs);
 		}
@@ -524,7 +637,9 @@ impl Tracer {
 			regs.rax = libc::SYS_fstat as u64;
 		} else {
 			// -> newfstatat(dirfd, path, statbuf(scratch), flags(r10))
-			regs.r10 = regs.rdx & 0x900; // AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT
+			// Only AT_SYMLINK_NOFOLLOW: older kernels reject AT_NO_AUTOMOUNT
+			// (0x800) with EINVAL (reproduced on 2.6.17; 2.6.20 accepts it).
+			regs.r10 = regs.rdx & 0x100;
 			regs.rdx = scratch;
 			regs.orig_rax = libc::SYS_newfstatat as u64;
 			regs.rax = libc::SYS_newfstatat as u64;
@@ -699,6 +814,40 @@ fn write_struct(pid: Pid, addr: u64, bytes: &[u8]) -> bool {
 			return false
 		}
 		off += 8;
+	}
+	true
+}
+
+/// Emulate getrandom(2) on kernels that lack it by filling the tracee's buffer
+/// from /dev/urandom.
+fn emulate_getrandom(pid: Pid, buf: u64, count: usize) -> bool {
+	if count == 0 {
+		return true
+	}
+	if buf == 0 {
+		return false
+	}
+	use std::io::Read;
+	let mut file = match std::fs::File::open("/dev/urandom") {
+		Ok(file) => file,
+		Err(_) => return false,
+	};
+	// Fill the entire requested range in bounded chunks: read_exact can return
+	// short reads and callers may ask for more than one chunk. Only report
+	// success once every byte has been written to the tracee.
+	const CHUNK: usize = 64 * 1024;
+	let mut chunk = vec![0u8; count.min(CHUNK)];
+	let mut off = 0usize;
+	while off < count {
+		let want = (count - off).min(CHUNK);
+		let dst = &mut chunk[..want];
+		if file.read_exact(dst).is_err() {
+			return false
+		}
+		if !write_struct(pid, buf + off as u64, dst) {
+			return false
+		}
+		off += want;
 	}
 	true
 }

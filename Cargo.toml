@@ -23,5 +23,5 @@ opt-level = 0
 [dependencies]
 goblin = "0.8.2"
 walkdir = "2.5.0"
-userland-execve = { git = "https://github.com/pkgforge-dev/userland-execve-rust", tag = "v0.3.0" }
-nix = { version = "0.31.1", features = [ "fs" ] }
+userland-execve = { git = "https://github.com/pkgforge-dev/userland-execve-rust", tag = "v0.3.2" }
+nix = { version = "0.31.1", features = [ "fs", "ptrace", "signal", "process" ] }

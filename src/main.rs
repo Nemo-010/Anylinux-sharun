@@ -13,6 +13,8 @@ mod apprun;
 mod gio_launch_desktop;
 mod bwrap_wrapper;
 mod set_appdir_env;
+#[cfg(target_arch = "x86_64")]
+mod kernel_compat;
 use utils::*;
 
 
@@ -42,6 +44,14 @@ fn print_usage() {
 	SHARUN_NO_NVIDIA_EGL_PRIME=1   Disables NVIDIA EGL prime logic
 	SHARUN_PRINTENV=1              Print environment variables to stderr
 	SHARUN_LDNAME=ld.so            Specifies the name of the interpreter
+	SHARUN_OLD_KERNEL_COMPAT=1     Enable compatibility layer that allows
+	                                applications to run on ancient kernels;
+	                                set to 0 to disable, default is automatic
+	                                on kernels older than 4.0 or when statx is missing
+	                                (on kernels without seccomp-bpf, < 3.5, every
+	                                syscall is traced, which is slow; seccomp mode
+	                                sets no_new_privs, so setuid helpers cannot
+	                                gain privileges)
 	SHARUN_EXTRA_LIBRARY_PATH      Extra library directories with highest priority
 	SHARUN_FALLBACK_LIBRARY_PATH   Fallback library directories with lowest priority
 	SHARUN_MESA_PATH=/path         External mesa install dir (with lib/ and share/)
@@ -185,6 +195,10 @@ fn main() {
 			exit(1)
 		}
 	} else if bin_name == "AppRun" {
+		#[cfg(target_arch = "x86_64")]
+		if kernel_compat::enabled() {
+			kernel_compat::run_apprun_traced(&sharun_dir, bin_dir, &exec_args);
+		}
 		apprun::run_as_apprun(&sharun_dir, bin_dir, &exec_args);
 	} else if bin_name == "gio-launch-desktop" {
 		gio_launch_desktop::run(&exec_args);

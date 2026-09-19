@@ -47,12 +47,18 @@ fn debug() -> bool {
 	matches!(env::var(ENV_DEBUG), Ok(v) if v == "1")
 }
 
+/// True when a raw syscall return means "not implemented": -1/ENOSYS, or the
+/// syscall number itself (seen on some old kernels, where it would otherwise
+/// look like success).
+fn not_implemented(nr: libc::c_long, rc: libc::c_long) -> bool {
+	rc == nr
+		|| (rc == -1
+			&& std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS))
+}
+
 /// Probe once whether the kernel implements ppoll(2). A zero timeout is used so
 /// the probe can never block: a working `ppoll(NULL, 0, {0,0}, NULL, 0)` returns
-/// 0 immediately. Ubuntu 6.10's 2.6.17 answers ENOSYS, and some old kernels
-/// answer unimplemented syscalls with the syscall number itself, so both count
-/// as missing. Only then is ppoll rewritten to poll; kernels that have it are
-/// left untouched.
+/// 0 immediately.
 fn ppoll_missing() -> bool {
 	static MISSING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 	*MISSING.get_or_init(|| {
@@ -67,9 +73,64 @@ fn ppoll_missing() -> bool {
 				0usize,
 			)
 		};
-		rc == libc::SYS_ppoll
-			|| (rc == -1
-				&& std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS))
+		not_implemented(libc::SYS_ppoll, rc)
+	})
+}
+
+/// Probe once whether the kernel implements pipe2(2) (added in 2.6.27). Only
+/// then is pipe2 rewritten to pipe, which loses O_CLOEXEC and O_NONBLOCK.
+fn pipe2_missing() -> bool {
+	static MISSING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*MISSING.get_or_init(|| {
+		let mut fds = [0i32; 2];
+		let rc = unsafe { libc::syscall(libc::SYS_pipe2, fds.as_mut_ptr(), 0) };
+		let missing = not_implemented(libc::SYS_pipe2, rc);
+		if !missing && rc == 0 {
+			// Close the two fds the probe created.
+			unsafe {
+				libc::close(fds[0]);
+				libc::close(fds[1]);
+			}
+		}
+		missing
+	})
+}
+
+/// Probe once whether the kernel implements getrandom(2) (added in 3.17). Only
+/// then is it emulated from /dev/urandom.
+fn getrandom_missing() -> bool {
+	static MISSING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*MISSING.get_or_init(|| {
+		// GRND_NONBLOCK (since 3.17) so a kernel that has getrandom is not
+		// mistaken for one that lacks it just because the CRNG is not ready
+		// yet; EAGAIN then simply means "present".
+		const GRND_NONBLOCK: libc::c_long = 0x0001;
+		let mut buf = [0u8; 16];
+		let rc = unsafe {
+			libc::syscall(libc::SYS_getrandom, buf.as_mut_ptr(), buf.len(), GRND_NONBLOCK)
+		};
+		not_implemented(libc::SYS_getrandom, rc)
+	})
+}
+
+/// Probe once whether the kernel implements statx(2) (added in 4.11). Only then
+/// is it translated to newfstatat.
+fn statx_missing() -> bool {
+	static MISSING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*MISSING.get_or_init(|| {
+		let mut stx = [0u8; 256];
+		let path = b"/\0";
+		let rc = unsafe {
+			libc::syscall(
+				libc::SYS_statx,
+				libc::AT_FDCWD,
+				path.as_ptr(),
+				0i32,
+				0u32,
+				stx.as_mut_ptr() as *mut libc::c_void,
+			)
+		};
+		not_implemented(libc::SYS_statx, rc)
 	})
 }
 
@@ -110,24 +171,7 @@ fn needs_compat() -> bool {
 	if kernel_lt(4, 0, 0) {
 		return true
 	}
-	syscall_missing(libc::SYS_statx)
-}
-
-/// True if `nr` is not implemented by this kernel (returns -ENOSYS).
-fn syscall_missing(nr: libc::c_long) -> bool {
-	let mut stx = [0u8; 256];
-	let path = b"/\0";
-	let rc = unsafe {
-		libc::syscall(
-			nr,
-			libc::AT_FDCWD,
-			path.as_ptr(),
-			0i32,
-			0u32,
-			stx.as_mut_ptr() as *mut libc::c_void,
-		)
-	};
-	rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS)
+	statx_missing()
 }
 
 /// Run `apprun::run_as_apprun` for `(sharun_dir, bin_dir, exec_args)` under the
@@ -217,18 +261,36 @@ fn install_seccomp_filter() -> bool {
 	const AUDIT_ARCH_X86_64: u32 = 0xc000003e;
 	let stmt = |code: u16, k: u32| libc::sock_filter { code, jt: 0, jf: 0, k };
 	let jump = |k: u32, jt: u8, jf: u8| libc::sock_filter { code: BPF_JEQ_K, jt, jf, k };
-	let filter = [
-		stmt(BPF_LD_W_ABS, 4), // seccomp_data.arch
-		jump(AUDIT_ARCH_X86_64, 1, 0),
-		stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW),
-		stmt(BPF_LD_W_ABS, 0), // seccomp_data.nr
-		jump(libc::SYS_futex as u32, 3, 0),
-		jump(libc::SYS_pipe2 as u32, 2, 0),
-		jump(libc::SYS_statx as u32, 1, 0),
-		jump(libc::SYS_getrandom as u32, 0, 1),
-		stmt(BPF_RET_K, libc::SECCOMP_RET_TRACE),
-		stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW),
-	];
+	// Only trap syscalls this kernel actually lacks (or, for futex, that
+	// predate the bitset ops). On anything newer the rewrites are wrong or
+	// pointless, and stopping on them just costs a signal per call.
+	let mut wanted: Vec<u32> = Vec::new();
+	if kernel_lt(2, 6, 25) {
+		wanted.push(libc::SYS_futex as u32);
+	}
+	if pipe2_missing() {
+		wanted.push(libc::SYS_pipe2 as u32);
+	}
+	if statx_missing() {
+		wanted.push(libc::SYS_statx as u32);
+	}
+	if getrandom_missing() {
+		wanted.push(libc::SYS_getrandom as u32);
+	}
+	let n = wanted.len();
+	let mut filter: Vec<libc::sock_filter> = Vec::with_capacity(6 + n);
+	filter.push(stmt(BPF_LD_W_ABS, 4)); // seccomp_data.arch
+	filter.push(jump(AUDIT_ARCH_X86_64, 1, 0));
+	filter.push(stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW));
+	filter.push(stmt(BPF_LD_W_ABS, 0)); // seccomp_data.nr
+	for (i, nr) in wanted.iter().enumerate() {
+		// On a match, skip the remaining comparisons to reach RET_TRACE.
+		filter.push(jump(*nr, (n - i) as u8, 0));
+	}
+	filter.push(stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW));
+	if n > 0 {
+		filter.push(stmt(BPF_RET_K, libc::SECCOMP_RET_TRACE));
+	}
 	let prog = libc::sock_fprog {
 		len: filter.len() as u16,
 		filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -430,7 +492,7 @@ impl Tracer {
 			// A timed WAIT_BITSET reserves scratch; if so it needs its exit
 			// stop so on_syscall_exit can restore rsp.
 			translate_futex(pid, regs, &mut self.reserved)
-		} else if regs.orig_rax == libc::SYS_pipe2 as u64 {
+		} else if regs.orig_rax == libc::SYS_pipe2 as u64 && pipe2_missing() {
 			let mut patched = regs;
 			patched.orig_rax = libc::SYS_pipe as u64;
 			patched.rax = libc::SYS_pipe as u64;
@@ -439,10 +501,10 @@ impl Tracer {
 				eprintln!("kernel-compat: (seccomp) pipe2 -> pipe (flags {:#x} dropped)", regs.rsi);
 			}
 			false
-		} else if regs.orig_rax == libc::SYS_statx as u64 {
+		} else if regs.orig_rax == libc::SYS_statx as u64 && statx_missing() {
 			self.setup_statx(pid, regs);
 			true
-		} else if regs.orig_rax == libc::SYS_getrandom as u64 {
+		} else if regs.orig_rax == libc::SYS_getrandom as u64 && getrandom_missing() {
 			// Need the exit stop to fill the buffer when the kernel lacks
 			// getrandom (3.17).
 			self.last_syscall.insert(pid, regs.orig_rax);
@@ -464,7 +526,7 @@ impl Tracer {
 			self.last_syscall.insert(pid, regs.orig_rax);
 			if regs.orig_rax == libc::SYS_futex as u64 {
 				translate_futex(pid, regs, &mut self.reserved);
-			} else if regs.orig_rax == libc::SYS_pipe2 as u64 {
+			} else if regs.orig_rax == libc::SYS_pipe2 as u64 && pipe2_missing() {
 				// pipe2 (2.6.27) -> pipe (ancient). The flags argument is lost
 				// entirely: neither O_NONBLOCK nor O_CLOEXEC is applied, and we
 				// cannot fix that from here. Callers that relied on pipe2 to
@@ -476,7 +538,7 @@ impl Tracer {
 				if debug() {
 					eprintln!("kernel-compat: pipe2 -> pipe (flags {:#x} dropped)", regs.rsi);
 				}
-			} else if regs.orig_rax == libc::SYS_statx as u64 {
+			} else if regs.orig_rax == libc::SYS_statx as u64 && statx_missing() {
 				self.setup_statx(pid, regs);
 			} else if regs.orig_rax == libc::SYS_ppoll as u64 && ppoll_missing() {
 				// ppoll -> poll, dropping the signal mask. Kernels that lack
@@ -550,7 +612,7 @@ impl Tracer {
 		// and panics with "range start index 318 out of range for slice of
 		// length 16", so we synthesize it regardless of the syscall's result.
 		let getrandom_nr = libc::SYS_getrandom as u64;
-		if self.last_syscall.get(&pid).copied() == Some(getrandom_nr) {
+		if self.last_syscall.get(&pid).copied() == Some(getrandom_nr) && getrandom_missing() {
 			if emulate_getrandom(pid, regs.rdi, regs.rsi as usize) {
 				if debug() {
 					eprintln!(
@@ -607,6 +669,10 @@ impl Tracer {
 			let nr = self.last_syscall.get(&pid).copied().unwrap_or(0);
 			eprintln!("kernel-compat: pid {pid} syscall {nr} -> ENOSYS");
 		}
+		// The entry was consumed. Without this, a later exit stop that reuses
+		// the slot (e.g. a statx exit after a getrandom exit) could re-enter
+		// the getrandom branch with the wrong registers.
+		self.last_syscall.remove(&pid);
 	}
 
 	/// statx (4.11) -> newfstatat (ancient), translating `struct stat` to
@@ -660,6 +726,14 @@ impl Tracer {
 /// which case the caller must let the syscall reach its exit stop so `rsp` can
 /// be restored.
 fn translate_futex(pid: Pid, mut regs: libc::user_regs_struct, reserved: &mut HashMap<Pid, u64>) -> bool {
+	// The bitset ops only exist from 2.6.25, and the private/realtime flags
+	// from 2.6.22/2.6.29. On anything newer (e.g. 3.x, where the layer still
+	// auto-enables for statx/getrandom) leave futex alone: stripping
+	// FUTEX_PRIVATE_FLAG changes glibc's locking behaviour and can stall the
+	// application.
+	if !kernel_lt(2, 6, 25) {
+		return false;
+	}
 	// x86_64: futex(uaddr, op, val, timeout, uaddr2, val3) ->
 	// rdi, rsi, rdx, r10, r8, r9
 	let op = regs.rsi as u32;

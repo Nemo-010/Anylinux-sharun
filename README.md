@@ -16,13 +16,13 @@ This fork is used by the [Anylinux-AppImages](https://github.com/pkgforge-dev/An
 
 - **`AppRun.sh` support**: If an `AppRun.sh` exists in the sharun directory and sharun is hardlink as the `AppRun`, it executes `AppRun.sh` using any `sh`/`bash` found in `PATH` or the AppDir, **removes hard `/bin/sh` dependency from `AppRun`.**
 
-- **Old kernel compatibility layer** (`x86_64` only): Runs AppImages built against a modern glibc on kernels far older than that glibc assumes, down to **Linux 2.6.17** (Ubuntu 6.10). Modern glibc (e.g. the `--enable-kernel=4.4` Arch build) both executes instructions old kernels do not support and calls syscalls that do not exist yet. The layer catches the resulting `SIGILL` and emulates the instruction (`XGETBV` etc.), and rewrites the offending syscalls at trace time:
+- **Old kernel compatibility layer** (`x86_64` only): Runs AppImages built against a modern glibc on kernels far older than that glibc assumes, down to **Linux 2.6.17** (Ubuntu 6.10). Modern glibc (e.g. the `--enable-kernel=4.4` Arch build) both executes instructions old kernels do not support and calls syscalls that do not exist yet. The layer catches the resulting `SIGILL` and emulates the instruction (`XGETBV` etc.), and rewrites the offending syscalls at trace time, each only when a one-time probe shows the running kernel lacks it:
 
   - `FUTEX_WAIT_BITSET`/`FUTEX_WAKE_BITSET` (2.6.25) to `FUTEX_WAIT`/`FUTEX_WAKE`.
   - `pipe2` (2.6.27) to `pipe`.
   - `statx` (4.11) to `newfstatat`/`fstat`, translating `struct stat` back to `struct statx` (Qt6 has no fallback when `statx` fails).
   - `getrandom` (3.17) filled from `/dev/urandom` (some kernels answer it with their own syscall number, which makes Rust's std panic).
-  - `ppoll` to `poll` only when a startup probe shows the kernel lacks `ppoll` (on x86_64 `ppoll` only works from 2.6.19, even though the syscall number was reserved back in 2.6.16).
+  - `ppoll` (2.6.19; the x86_64 number was reserved in 2.6.16 but only wired up in 2.6.19) to `poll`.
   - `ENOSYS` is forced for newer syscalls that some kernels answer with their own syscall number instead of failing (`prlimit64`, `rseq`, `clone3`, `openat2`, `faccessat2`, `signalfd`/`signalfd4`, `timerfd_create`, `eventfd`/`eventfd2`, `accept4`, `epoll_create1`, `dup3`, `inotify_init1`).
 
   It is enabled automatically on kernels older than 4.0 or when `statx` is missing; set `SHARUN_OLD_KERNEL_COMPAT=1` to force it on and `=0` to disable. `SHARUN_OLD_KERNEL_COMPAT_DEBUG=1` prints every translation to stderr. On kernels with seccomp-bpf (3.5+) only the affected syscalls are intercepted, but seccomp mode sets `no_new_privs`, so setuid helpers cannot gain privileges; older kernels fall back to tracing every syscall with ptrace, which is much slower. The tracer is only installed from `AppRun`, never from the `bin/*` hardlinks. Kernels older than 2.6.16 cannot be supported because the AppImage runtime itself needs the `*at` syscalls (for example `openat`).

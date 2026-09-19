@@ -1,5 +1,6 @@
 use std::{
 	env,
+	ffi::CStr,
 	path::Path,
 	process::{Command, exit},
 	fs::read_to_string,
@@ -10,6 +11,21 @@ use crate::utils::{find_shell, is_file, basename, add_to_env, get_env_var};
 
 extern "C" {
 	fn getuid() -> u32;
+}
+
+/// The running kernel version as `major.minor.patch` (e.g. `2.6.17`), taken from
+/// `uname(2)`'s release and stripped of any `-extra` suffix.
+fn host_kernel_version() -> String {
+	let mut uts: nix::libc::utsname = unsafe { std::mem::zeroed() };
+	if unsafe { nix::libc::uname(&mut uts) } != 0 {
+		return String::new()
+	}
+	let release = unsafe { CStr::from_ptr(uts.release.as_ptr()) }.to_string_lossy();
+	let mut parts = release.split(|c: char| !c.is_ascii_digit());
+	let a = parts.next().unwrap_or("0");
+	let b = parts.next().unwrap_or("0");
+	let c = parts.next().unwrap_or("0");
+	format!("{a}.{b}.{c}")
 }
 
 fn env_or(keys: &[&str], fallback: &str) -> String {
@@ -35,6 +51,7 @@ pub fn run_as_apprun(
 	env::set_var("HOST_XDG_DATA_HOME", env_or(&["REAL_XDG_DATA_HOME", "XDG_DATA_HOME"], &format!("{host_home}/.local/share")));
 	env::set_var("HOST_XDG_CACHE_HOME", env_or(&["REAL_XDG_CACHE_HOME", "XDG_CACHE_HOME"], &format!("{host_home}/.cache")));
 	env::set_var("HOST_XDG_STATE_HOME", env_or(&["REAL_XDG_STATE_HOME", "XDG_STATE_HOME"], &format!("{host_home}/.local/state")));
+	env::set_var("HOST_KERNEL_VERSION", host_kernel_version());
 
 	env::set_var("APPIMAGE_ARCH", std::env::consts::ARCH);
 	env::set_var("APPIMAGE_UID", unsafe { getuid() }.to_string());

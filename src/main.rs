@@ -20,6 +20,11 @@ use utils::*;
 
 const SHARUN_NAME: &str = env!("CARGO_PKG_NAME");
 
+/// Internal-only flag used by the kernel-compat no_new_privs/execve probe. It
+/// is intentionally long so it cannot collide with an application argument.
+pub(crate) const SHARUN_NNP_PROBE_FLAG: &str =
+	"--sharun-internal-probe-execve-after-no-new-privs";
+
 
 fn print_usage() {
 	println!("[ {} ]
@@ -195,6 +200,12 @@ fn main() {
 			exit(1)
 		}
 	} else if bin_name == "AppRun" {
+		// Sentinel for the kernel-compat probe: a re-exec of this binary with
+		// no_new_privs set only checks whether execve works on this kernel, so
+		// exit immediately instead of recursing into the AppRun logic.
+		if exec_args.iter().any(|arg| arg.as_str() == SHARUN_NNP_PROBE_FLAG) {
+			exit(0)
+		}
 		#[cfg(target_arch = "x86_64")]
 		if kernel_compat::enabled() {
 			kernel_compat::run_apprun_traced(&sharun_dir, bin_dir, &exec_args);

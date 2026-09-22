@@ -26,7 +26,7 @@ use nix::{
 	sys::{
 		ptrace::{self, AddressType, Options},
 		signal::{raise, Signal},
-		wait::{waitpid, WaitPidFlag, WaitStatus},
+		wait::{waitpid, WaitStatus},
 	},
 	unistd::{fork, ForkResult, Pid},
 	libc,
@@ -134,6 +134,40 @@ fn statx_missing() -> bool {
 	})
 }
 
+/// Probe once whether `PR_SET_NO_NEW_PRIVS` breaks `execve` on this kernel.
+///
+/// Some kernels (observed on 3.8.0-19 from Ubuntu 13.04) return EPERM from
+/// `execve` once no_new_privs is set. Installing a seccomp filter requires
+/// no_new_privs, so on such a kernel the AppRun re-exec fails and the app never
+/// starts. Detect it and fall back to tracing every syscall instead.
+///
+/// `/proc/self/exe` is used so that no external binary (like `/bin/true`) is
+/// needed, which also works on systems such as NixOS. The re-exec'd sharun
+/// exits at once thanks to the `SHARUN_NNP_PROBE` sentinel.
+fn nnp_exec_broken() -> bool {
+	static BROKEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*BROKEN.get_or_init(|| {
+		use std::os::unix::process::CommandExt;
+		let mut cmd = std::process::Command::new("/proc/self/exe");
+		// Reuse this process's argv[0] so the re-exec lands in the same mode
+		// (AppRun) as the current one, where the sentinel flag is honored.
+		if let Some(arg0) = std::env::args_os().next() {
+			cmd.arg0(arg0);
+		}
+		cmd.arg(crate::SHARUN_NNP_PROBE_FLAG);
+		unsafe {
+			cmd.pre_exec(|| {
+				libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+				Ok(())
+			});
+		}
+		match cmd.status() {
+			Ok(status) => !status.success(),
+			Err(err) => err.raw_os_error() == Some(libc::EPERM),
+		}
+	})
+}
+
 fn kernel_lt(want_major: u64, want_minor: u64, want_patch: u64) -> bool {
 	let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
 	if unsafe { libc::uname(&mut uts) } != 0 {
@@ -185,6 +219,10 @@ pub fn run_apprun_traced(sharun_dir: &str, bin_dir: &str, exec_args: &[String]) 
 		eprintln!("[sharun] ptrace unavailable, running without old kernel compatibility");
 		crate::apprun::run_as_apprun(sharun_dir, bin_dir, exec_args);
 	}
+
+	// Prime the no_new_privs/execve probe in this (untraced) parent, so the
+	// traced child does not have to fork while it is being ptraced.
+	let _ = nnp_exec_broken();
 
 	// Handshake pipe: the child reports whether it could install the seccomp
 	// filter, so the parent knows whether to stop only on the translated
@@ -254,6 +292,15 @@ fn ptrace_permitted() -> bool {
 /// which case the caller falls back to tracing every syscall.
 #[cfg(target_arch = "x86_64")]
 fn install_seccomp_filter() -> bool {
+	// no_new_privs is required to install the filter, but on some kernels it
+	// makes execve fail (see nnp_exec_broken), which would break the AppRun
+	// re-exec. Fall back to tracing every syscall in that case.
+	if nnp_exec_broken() {
+		if debug() {
+			eprintln!("kernel-compat: seccomp unusable (no_new_privs breaks execve)");
+		}
+		return false
+	}
 	const BPF_LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
 	const BPF_JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
 	const BPF_RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
@@ -341,6 +388,62 @@ fn tracer_options(seccomp: bool) -> Vec<Options> {
 	opts
 }
 
+/// Minimal wait result. Unlike nix's `WaitStatus`, this tolerates stop signals
+/// that nix's `Signal` enum cannot represent (e.g. real-time signals): decoding
+/// those makes `WaitStatus::from_raw` return `EINVAL`, which otherwise leaves
+/// the tracee stopped forever.
+enum Wait {
+	Exited(Pid, i32),
+	Signaled(Pid, i32),
+	/// Stopped by the raw signal number.
+	Stopped(Pid, i32),
+	/// A ptrace event (SIGTRAP + event code).
+	Event(Pid, u32),
+	/// A syscall stop (PTRACE_O_TRACESYSGOOD).
+	Syscall(Pid),
+}
+
+fn wait_any() -> Result<Wait, Errno> {
+	let mut status: libc::c_int = 0;
+	let rc = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
+	if rc < 0 {
+		return Err(Errno::last())
+	}
+	let pid = Pid::from_raw(rc);
+	let s = status;
+	if s & 0x7f == 0 {
+		Ok(Wait::Exited(pid, (s >> 8) & 0xff))
+	} else if s & 0xff == 0x7f {
+		let sig = (s >> 8) & 0xff;
+		if sig & 0x80 != 0 {
+			Ok(Wait::Syscall(pid))
+		} else {
+			let event = (s >> 16) as u32;
+			if event != 0 {
+				Ok(Wait::Event(pid, event))
+			} else {
+				Ok(Wait::Stopped(pid, sig))
+			}
+		}
+	} else {
+		// Continued stops (0xffff) cannot appear here since `WCONTINUED` is not
+		// requested, so anything left is a signal death.
+		Ok(Wait::Signaled(pid, s & 0x7f))
+	}
+}
+
+fn ptrace_resume(request: libc::c_uint, pid: Pid, sig: Option<i32>) -> Result<(), ()> {
+	let rc = unsafe {
+		libc::ptrace(
+			request as _,
+			pid.as_raw() as libc::pid_t,
+			std::ptr::null_mut::<libc::c_void>(),
+			sig.unwrap_or(0) as *mut libc::c_void,
+		)
+	};
+	if rc == -1 { Err(()) } else { Ok(()) }
+}
+
 struct Tracer {
 	child: Pid,
 	configured: HashSet<Pid>,
@@ -350,6 +453,10 @@ struct Tracer {
 	/// rsp to restore at syscall-exit for tracees whose translated syscall
 	/// needed scratch space carved below the stack pointer.
 	reserved: HashMap<Pid, u64>,
+	/// Pids resumed from a seccomp stop with PTRACE_SYSCALL for which the
+	/// spurious syscall-entry stop has not been consumed yet. The entry stop
+	/// must be skipped; the stop after it carries the syscall result.
+	expect_entry: HashSet<Pid>,
 	/// true when tracing every syscall (fallback); false in seccomp mode.
 	syscall_mode: bool,
 	/// true when the seccomp filter is installed, so we only stop on the
@@ -366,13 +473,28 @@ struct StatxState {
 }
 
 impl Tracer {
-	fn resume(&self, pid: Pid, sig: Option<Signal>) {
-		let res = if self.syscall_mode {
-			ptrace::syscall(pid, sig)
+	fn resume(&self, pid: Pid, sig: Option<i32>) {
+		let request = if self.syscall_mode {
+			libc::PTRACE_SYSCALL as libc::c_uint
 		} else {
-			ptrace::cont(pid, sig)
+			libc::PTRACE_CONT as libc::c_uint
 		};
-		let _ = res;
+		let _ = ptrace_resume(request, pid, sig);
+	}
+
+	fn resume_syscall(&self, pid: Pid, sig: Option<i32>) {
+		let _ = ptrace_resume(libc::PTRACE_SYSCALL as libc::c_uint, pid, sig);
+	}
+
+	/// Drop all per-pid state once a tracee is gone, so a recycled pid cannot
+	/// inherit stale state (e.g. a `reserved` rsp applied to a later stop).
+	fn forget(&mut self, pid: Pid) {
+		self.configured.remove(&pid);
+		self.in_syscall.remove(&pid);
+		self.last_syscall.remove(&pid);
+		self.statx.remove(&pid);
+		self.reserved.remove(&pid);
+		self.expect_entry.remove(&pid);
 	}
 
 	fn supervise(&mut self) -> ! {
@@ -391,11 +513,12 @@ impl Tracer {
 		self.resume(self.child, None);
 
 		loop {
-			match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::__WALL)) {
-				Ok(WaitStatus::Exited(pid, code)) => {
+			match wait_any() {
+				Ok(Wait::Exited(pid, code)) => {
 					if debug() {
 						eprintln!("kernel-compat: pid {pid} exited {code}");
 					}
+					self.forget(pid);
 					if pid == self.child {
 						// In seccomp mode the filter outlives us, so keep
 						// running until every tracee is gone.
@@ -406,19 +529,20 @@ impl Tracer {
 						}
 					}
 				},
-				Ok(WaitStatus::Signaled(pid, sig, _)) => {
+				Ok(Wait::Signaled(pid, sig)) => {
 					if debug() {
 						eprintln!("kernel-compat: pid {pid} killed by {sig:?}");
 					}
+					self.forget(pid);
 					if pid == self.child {
 						if self.seccomp_mode {
-							self.main_code = Some(128 + sig as i32);
+							self.main_code = Some(128 + sig);
 						} else {
-							exit(128 + sig as i32)
+							exit(128 + sig)
 						}
 					}
 				},
-				Ok(WaitStatus::Stopped(pid, sig)) => {
+				Ok(Wait::Stopped(pid, sig)) => {
 					if debug() {
 						eprintln!("kernel-compat: pid {pid} stopped: {sig:?}");
 					}
@@ -426,7 +550,7 @@ impl Tracer {
 					if pid != self.child && !self.configured.contains(&pid) {
 						install_options(pid, &tracer_options(self.seccomp_mode));
 						self.configured.insert(pid);
-						if sig == Signal::SIGSTOP {
+						if sig == libc::SIGSTOP {
 							self.resume(pid, None);
 							continue;
 						}
@@ -435,42 +559,55 @@ impl Tracer {
 					// syscall's exit stop is pending must not be resumed with
 					// PTRACE_CONT: that clears the syscall-trace flag and the
 					// exit stop (which restores rsp) would never fire.
-					let pending = self.seccomp_mode && self.reserved.contains_key(&pid);
-					let suppress = sig == Signal::SIGILL && emulate_sigill(pid);
+					let pending = self.seccomp_mode
+						&& (self.reserved.contains_key(&pid)
+							|| self.expect_entry.contains(&pid)
+							|| self.statx.contains_key(&pid)
+							|| self.last_syscall.contains_key(&pid));
+					let suppress = sig == libc::SIGILL && emulate_sigill(pid);
 					if pending {
-						let _ = ptrace::syscall(pid, if suppress { None } else { Some(sig) });
+						self.resume_syscall(pid, if suppress { None } else { Some(sig) });
 					} else if suppress {
 						self.resume(pid, None);
 					} else {
 						self.resume(pid, Some(sig));
 					}
 				},
-				Ok(WaitStatus::PtraceEvent(pid, _sig, event))
-					if event == libc::PTRACE_EVENT_SECCOMP =>
-				{
-					// A filtered syscall: translate it, then continue. statx
-					// also needs its exit stop to convert the result struct.
+				Ok(Wait::Event(pid, event)) if event == libc::PTRACE_EVENT_SECCOMP as u32 => {
+					// A filtered syscall: translate it, then continue. statx,
+					// getrandom and the timed futex also need the exit stop to
+					// convert the result, fill the buffer or restore rsp.
 					if self.on_seccomp_stop(pid) {
-						let _ = ptrace::syscall(pid, None);
+						// PTRACE_SYSCALL from a seccomp stop also trips the
+						// syscall-entry trace, so the next stop is the entry,
+						// not the exit. Remember we owe an exit.
+						self.expect_entry.insert(pid);
+						self.resume_syscall(pid, None);
 					} else {
 						self.resume(pid, None);
 					}
 				},
-				Ok(WaitStatus::PtraceEvent(pid, _sig, _event)) => {
+				Ok(Wait::Event(pid, _event)) => {
 					// Restart event stops with signal 0 (like strace does), not
 					// with the synthetic SIGTRAP nix reports for them.
 					self.resume(pid, None);
 				},
-				Ok(WaitStatus::PtraceSyscall(pid)) => {
+				Ok(Wait::Syscall(pid)) => {
 					if self.seccomp_mode {
-						// Only reached for the statx exit we asked for.
-						self.on_syscall_exit(pid);
+						if self.expect_entry.remove(&pid) {
+							// The syscall-entry stop generated right after the
+							// seccomp stop; skip it and ask for the exit stop
+							// that follows.
+							self.resume_syscall(pid, None);
+						} else {
+							self.on_syscall_exit(pid);
+							self.resume(pid, None);
+						}
 					} else {
 						self.on_syscall_stop(pid);
+						self.resume(pid, None);
 					}
-					self.resume(pid, None);
 				},
-				Ok(_) => {},
 				Err(Errno::ECHILD) => exit(self.main_code.unwrap_or(0)),
 				Err(err) => {
 					if debug() {
@@ -1018,6 +1155,7 @@ fn supervise(child: Pid, use_seccomp: bool) -> ! {
 		last_syscall: HashMap::new(),
 		statx: HashMap::new(),
 		reserved: HashMap::new(),
+		expect_entry: HashSet::new(),
 		syscall_mode,
 		seccomp_mode,
 		main_code: None,

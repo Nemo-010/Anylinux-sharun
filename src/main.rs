@@ -68,7 +68,7 @@ fn print_usage() {
 }
 
 fn main() {
-	let sharun = env::current_exe().unwrap_or_else(|err|{
+	let sharun = get_current_exe().unwrap_or_else(|err|{
 		eprintln!("Failed to get sharun path: {err}");
 		exit(1)
 	});

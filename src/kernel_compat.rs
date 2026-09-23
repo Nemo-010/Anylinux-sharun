@@ -141,14 +141,19 @@ fn statx_missing() -> bool {
 /// no_new_privs, so on such a kernel the AppRun re-exec fails and the app never
 /// starts. Detect it and fall back to tracing every syscall instead.
 ///
-/// `/proc/self/exe` is used so that no external binary (like `/bin/true`) is
-/// needed, which also works on systems such as NixOS. The re-exec'd sharun
-/// exits at once thanks to the `SHARUN_NNP_PROBE` sentinel.
+/// The path of the running sharun is resolved through `utils::get_current_exe()`
+/// (AT_EXECFN, then current_exe when it is a file, then argv[0]/PATH) so that no
+/// external binary (like `/bin/true`) is needed, which also works on systems
+/// such as NixOS. The re-exec'd sharun exits at once thanks to the
+/// `SHARUN_NNP_PROBE` sentinel.
 fn nnp_exec_broken() -> bool {
 	static BROKEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 	*BROKEN.get_or_init(|| {
 		use std::os::unix::process::CommandExt;
-		let mut cmd = std::process::Command::new("/proc/self/exe");
+		// Without a path to re-exec there is no way to probe; assume the
+		// kernel is fine, like when the probe itself could not run.
+		let Ok(exe) = crate::utils::get_current_exe() else { return false };
+		let mut cmd = std::process::Command::new(exe);
 		// Reuse this process's argv[0] so the re-exec lands in the same mode
 		// (AppRun) as the current one, where the sentinel flag is honored.
 		if let Some(arg0) = std::env::args_os().next() {

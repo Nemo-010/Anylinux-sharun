@@ -2,7 +2,7 @@ use std::{
 	collections::HashSet,
 	env,
 	path::{Path, PathBuf},
-	ffi::OsStr,
+	ffi::{CStr, OsStr},
 	process::{Command, exit},
 	fs::{File, write, read_to_string, read, read_dir},
 	os::unix::{fs::{MetadataExt, PermissionsExt}, process::CommandExt},
@@ -10,7 +10,7 @@ use std::{
 };
 
 use walkdir::WalkDir;
-use nix::unistd::{access, AccessFlags};
+use nix::{libc, unistd::{access, AccessFlags}};
 use goblin::elf::Elf;
 
 
@@ -135,6 +135,60 @@ pub fn which(executable: &str) -> Option<PathBuf> {
 		}
 	}
 	None
+}
+
+/// Best-effort path to the running executable.
+///
+/// `std::env::current_exe()` is just a `readlink("/proc/self/exe")` on Linux.
+/// It fails when `/proc` is not mounted, and even when it is mounted it can
+/// resolve into an overlayfs lower layer (e.g. `/rofs/bin/...` on Ubuntu casper
+/// live ISOs) where the backing file is reachable, so `is_file` alone cannot
+/// tell it apart from the merged path. Prefer `AT_EXECFN`, the filename passed
+/// to `execve(2)`, which is the caller's (merged) view and needs no procfs;
+/// then fall back to `current_exe()` when it is a file, and finally to
+/// `argv[0]`: absolute or path-like arguments are resolved against the current
+/// directory, a bare name is searched in PATH.
+pub fn get_current_exe() -> Result<PathBuf> {
+	if let Some(exe) = exe_from_execfn() {
+		return Ok(exe)
+	}
+	if let Ok(exe) = env::current_exe() {
+		if is_file(&exe) {
+			return Ok(exe)
+		}
+	}
+	let arg0 = env::args_os().next().unwrap_or_default();
+	resolve_exe_path(&arg0.to_string_lossy()).ok_or_else(|| Error::new(NotFound,
+		"Unable to determine the path of the running executable"))
+}
+
+/// `AT_EXECFN` holds the filename passed to `execve(2)`, independently of
+/// procfs. A shell that resolves a bare command through PATH records the full
+/// path there, while `argv[0]` may still be only the command name.
+fn exe_from_execfn() -> Option<PathBuf> {
+	let ptr = unsafe { libc::getauxval(libc::AT_EXECFN) } as *const libc::c_char;
+	if ptr.is_null() {
+		return None
+	}
+	let execfn = unsafe { CStr::from_ptr(ptr) }.to_str().ok()?;
+	resolve_exe_path(execfn)
+}
+
+/// Resolve an executable path that is absolute, relative to the current
+/// directory, or a bare name to search in PATH. Only existing files are used.
+fn resolve_exe_path(path: &str) -> Option<PathBuf> {
+	if path.is_empty() {
+		return None
+	}
+	if !path.contains('/') {
+		return which(path)
+	}
+	let path = if path.starts_with('/') {
+		PathBuf::from(path)
+	} else {
+		env::current_dir().ok()?.join(path)
+	};
+	path.canonicalize().ok().filter(|exe| is_file(exe))
 }
 
 pub fn find_shell() -> Option<PathBuf> {

@@ -17,7 +17,7 @@ pub fn setup(
 ) -> String {
 	let lib_path_data = set_lib_env(bin_dir, library_path, sharun_dir);
 	set_mesa_lib_env(mesa_lib);
-	set_share_env(sharun_dir, mesa_share);
+	set_share_env(sharun_dir, library_path, mesa_share);
 	set_etc_env(sharun_dir);
 	lib_path_data
 }
@@ -322,7 +322,25 @@ fn set_lib_env(
 	lib_path_data
 }
 
-fn set_share_env(sharun_dir: &str, mesa_share: Option<&str>) {
+// When pipewire is not deployed there is no libasound_module_pcm_pipewire.so
+// This means that if the host config defaults to pipewire-alsa
+// which is very common on systems that have pipewire, the appimage will try
+// to dlopen libasound_module_pcm_pipewire.so and fail.
+//
+// So we have to fix this issue in two ways:
+// * If the pipewire alsa plugin is NOT bundled, use the bundled alsa config.
+// * If the pipewire alsa plugin IS bundled, always use the host alsa config,
+//   this way we prevent the reverse issue of alsa using the pipewire plugin
+//   on systems that do not have pipewire-alsa at all and would fail to work.
+fn is_alsa_plugin_bundled(library_path: &str, plugin: &str) -> bool {
+	Path::new(&format!("{library_path}/alsa-lib")).read_dir().is_ok_and(|entries| {
+		entries.flatten().any(|entry| {
+			entry.file_name().to_string_lossy().contains(plugin)
+		})
+	})
+}
+
+fn set_share_env(sharun_dir: &str, library_path: &str, mesa_share: Option<&str>) {
 	let share_dir = PathBuf::from(format!("{sharun_dir}/share"));
 	let mesa_share_dir = mesa_share.and_then(|p| {
 		if Path::new(p).is_dir() { Some(PathBuf::from(p)) } else { None }
@@ -357,7 +375,7 @@ fn set_share_env(sharun_dir: &str, mesa_share: Option<&str>) {
 					match name.to_str().unwrap_or_default() {
 						"alsa" => {
 							let alsa_conf = entry_path.join("alsa.conf");
-							if !Path::new("/usr/share/alsa/alsa.conf").exists() && alsa_conf.exists() {
+							if alsa_conf.exists() && !is_alsa_plugin_bundled(library_path, "pipewire") {
 								env::set_var("ALSA_CONFIG_PATH", alsa_conf)
 							}
 						}

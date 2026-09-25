@@ -932,37 +932,62 @@ impl Tracer {
 		}
 	}
 
-	/// Handle a `SECCOMP_RET_TRACE` stop. Returns whether the caller must resume
-	/// with `PTRACE_SYSCALL` to also catch the syscall exit (statx only).
-	fn on_seccomp_stop(&mut self, pid: Pid) -> bool {
-		let regs = match ptrace::getregs(pid) {
-			Ok(regs) => regs,
-			Err(_) => return false,
-		};
+	/// Rewrites shared by both tracing modes. In seccomp mode only the syscalls
+	/// in the filter reach here, but every branch is gated on its own probe so the
+	/// ptrace path can call this for any syscall.
+	///
+	/// `Some(needs_exit)` when the call is one of the shared ones: `true` means the
+	/// caller must arrange a syscall-exit stop (statx has a buffer to fill, a
+	/// relative futex timeout carved scratch below rsp), `false` means the call is
+	/// complete. `None` leaves the syscall to the caller.
+	fn translate_common(
+		&mut self,
+		pid: Pid,
+		regs: libc::user_regs_struct,
+	) -> Option<bool> {
 		if regs.orig_rax == libc::SYS_futex as u64 {
 			// A timed WAIT_BITSET reserves scratch; if so it needs its exit
 			// stop so on_syscall_exit can restore rsp.
-			translate_futex(pid, regs, &mut self.reserved)
-		} else if regs.orig_rax == libc::SYS_pipe2 as u64 && pipe2_missing() {
+			return Some(translate_futex(pid, regs, &mut self.reserved));
+		}
+		if regs.orig_rax == libc::SYS_pipe2 as u64 && pipe2_missing() {
+			// pipe2 (2.6.27) -> pipe (ancient). The flags argument is lost
+			// entirely: neither O_NONBLOCK nor O_CLOEXEC is applied, and we
+			// cannot fix that from here. Callers that relied on pipe2 to set
+			// those flags will see a blocking, inheritable pipe.
 			let mut patched = regs;
 			patched.orig_rax = libc::SYS_pipe as u64;
 			patched.rax = libc::SYS_pipe as u64;
 			let _ = ptrace::setregs(pid, patched);
 			if debug() {
-				eprintln!("kernel-compat: (seccomp) pipe2 -> pipe (flags {:#x} dropped)", regs.rsi);
+				eprintln!("kernel-compat: pipe2 -> pipe (flags {:#x} dropped)", regs.rsi);
 			}
-			false
-		} else if regs.orig_rax == libc::SYS_statx as u64 && statx_missing() {
+			return Some(false);
+		}
+		if regs.orig_rax == libc::SYS_statx as u64 && statx_missing() {
 			self.setup_statx(pid, regs);
-			true
-		} else if regs.orig_rax == libc::SYS_getrandom as u64 && getrandom_missing() {
+			return Some(true);
+		}
+		None
+	}
+
+	/// Handle a `SECCOMP_RET_TRACE` stop. Returns whether the caller must resume
+	/// with `PTRACE_SYSCALL` to also catch the syscall exit.
+	fn on_seccomp_stop(&mut self, pid: Pid) -> bool {
+		let regs = match ptrace::getregs(pid) {
+			Ok(regs) => regs,
+			Err(_) => return false,
+		};
+		if let Some(needs_exit) = self.translate_common(pid, regs) {
+			return needs_exit;
+		}
+		if regs.orig_rax == libc::SYS_getrandom as u64 && getrandom_missing() {
 			// Need the exit stop to fill the buffer when the kernel lacks
 			// getrandom (3.17).
 			self.last_syscall.insert(pid, regs.orig_rax);
-			true
-		} else {
-			false
+			return true;
 		}
+		false
 	}
 
 	fn on_syscall_stop(&mut self, pid: Pid) {
@@ -989,21 +1014,12 @@ impl Tracer {
 				return
 			}
 			self.last_syscall.insert(pid, regs.orig_rax);
-			if regs.orig_rax == libc::SYS_futex as u64 {
-				translate_futex(pid, regs, &mut self.reserved);
-			} else if regs.orig_rax == libc::SYS_pipe2 as u64 && pipe2_missing() {
-				// pipe2 (2.6.27) -> pipe (ancient). The flags argument is lost
-				// entirely: neither O_NONBLOCK nor O_CLOEXEC is applied, and we
-				// cannot fix that from here. Callers that relied on pipe2 to
-				// set those flags will see a blocking, inheritable pipe.
-				let mut patched = regs;
-				patched.orig_rax = libc::SYS_pipe as u64;
-				patched.rax = libc::SYS_pipe as u64;
-				let _ = ptrace::setregs(pid, patched);
-				if debug() {
-					eprintln!("kernel-compat: pipe2 -> pipe (flags {:#x} dropped)", regs.rsi);
-				}
-			} else if regs.orig_rax == libc::SYS_epoll_create1 as u64 && epoll_create1_missing() {
+			if self.translate_common(pid, regs).is_some() {
+				// futex, pipe2 and statx are done; no syscall number below can
+				// also match, so there is nothing left to try.
+				return
+			}
+			if regs.orig_rax == libc::SYS_epoll_create1 as u64 && epoll_create1_missing() {
 				// epoll_create1 (2.6.27) -> epoll_create (2.6). The size argument
 				// is ignored by every kernel that has the old call, but
 				// EPOLL_CLOEXEC is lost, so the fd is inheritable. It has to work
@@ -1021,8 +1037,6 @@ impl Tracer {
 						regs.rdi
 					);
 				}
-			} else if regs.orig_rax == libc::SYS_statx as u64 && statx_missing() {
-				self.setup_statx(pid, regs);
 			} else if regs.orig_rax == libc::SYS_prlimit64 as u64 && prlimit64_missing() {
 				// prlimit64(pid, resource, new, old) -> getrlimit/setrlimit.
 				// `struct rlimit` and `struct rlimit64` are the same two u64s on

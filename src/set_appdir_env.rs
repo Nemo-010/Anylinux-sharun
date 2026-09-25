@@ -17,7 +17,7 @@ pub fn setup(
 ) -> String {
 	let lib_path_data = set_lib_env(bin_dir, library_path, sharun_dir);
 	set_mesa_lib_env(mesa_lib);
-	set_share_env(sharun_dir, mesa_share);
+	set_share_env(sharun_dir, library_path, mesa_share);
 	set_etc_env(sharun_dir);
 	lib_path_data
 }
@@ -322,7 +322,22 @@ fn set_lib_env(
 	lib_path_data
 }
 
-fn set_share_env(sharun_dir: &str, mesa_share: Option<&str>) {
+// When pipewire is not deployed there is no libasound_module_pcm_pipewire.so,
+// so a host config that selects the pipewire plugin (pipewire-alsa installs
+// e.g. /etc/alsa/conf.d/99-pipewire-default.conf) cannot work. Fall back to
+// the bundled alsa.conf, which makes the bundled 99-pulseaudio-default.conf
+// the default PCM. When pipewire is deployed the host config is kept: the
+// build container's /usr/share/alsa/alsa.conf.d may hold a pipewire default
+// that must not become the default on a host without a running pipewire.
+fn bundle_deploys_alsa_plugin(library_path: &str, plugin: &str) -> bool {
+	Path::new(&format!("{library_path}/alsa-lib")).read_dir().is_ok_and(|entries| {
+		entries.flatten().any(|entry| {
+			entry.file_name().to_string_lossy().contains(plugin)
+		})
+	})
+}
+
+fn set_share_env(sharun_dir: &str, library_path: &str, mesa_share: Option<&str>) {
 	let share_dir = PathBuf::from(format!("{sharun_dir}/share"));
 	let mesa_share_dir = mesa_share.and_then(|p| {
 		if Path::new(p).is_dir() { Some(PathBuf::from(p)) } else { None }
@@ -357,7 +372,8 @@ fn set_share_env(sharun_dir: &str, mesa_share: Option<&str>) {
 					match name.to_str().unwrap_or_default() {
 						"alsa" => {
 							let alsa_conf = entry_path.join("alsa.conf");
-							if !Path::new("/usr/share/alsa/alsa.conf").exists() && alsa_conf.exists() {
+							if alsa_conf.exists() &&
+								!bundle_deploys_alsa_plugin(library_path, "pipewire") {
 								env::set_var("ALSA_CONFIG_PATH", alsa_conf)
 							}
 						}

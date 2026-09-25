@@ -15,6 +15,8 @@ mod bwrap_wrapper;
 mod set_appdir_env;
 #[cfg(target_arch = "x86_64")]
 mod kernel_compat;
+#[cfg(target_arch = "x86_64")]
+mod emulated_syscalls;
 use utils::*;
 
 

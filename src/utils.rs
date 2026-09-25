@@ -14,6 +14,31 @@ use nix::unistd::{access, AccessFlags};
 use goblin::elf::Elf;
 
 
+/// Debian-style multiarch triplet for the target, e.g. `x86_64-linux-gnu`.
+/// `None` on architectures that do not use one.
+pub fn multiarch_triplet() -> Option<&'static str> {
+	match std::env::consts::ARCH {
+		"x86_64" => Some("x86_64-linux-gnu"),
+		"aarch64" => Some("aarch64-linux-gnu"),
+		"riscv64" => Some("riscv64-linux-gnu"),
+		"loongarch64" => Some("loongarch64-linux-gnu"),
+		"powerpc64" => if cfg!(target_endian = "big") {
+			Some("powerpc64-linux-gnu")
+		} else {
+			Some("powerpc64le-linux-gnu")
+		},
+		_ => None,
+	}
+}
+
+/// Multiarch triplet of the 32-bit runtime, where one is deployed.
+pub fn multiarch_triplet_32() -> Option<&'static str> {
+	match std::env::consts::ARCH {
+		"x86_64" => Some("i386-linux-gnu"),
+		_ => None,
+	}
+}
+
 pub fn get_interpreter(library_path: &str) -> Result<PathBuf> {
 	let mut interpreters = Vec::new();
 	if let Ok(ldname) = env::var("SHARUN_LDNAME") {

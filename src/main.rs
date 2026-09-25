@@ -342,22 +342,14 @@ fn main() {
 	library_path += ":/usr/local/lib:/usr/lib:/lib";
 	if is_elf32_bin {
 		library_path += ":/usr/local/lib32:/usr/lib32:/lib32";
-		#[cfg(target_arch = "x86_64")]
-		{ library_path += ":/usr/lib/i386-linux-gnu" }
+		if let Some(triplet) = multiarch_triplet_32() {
+			library_path += &format!(":/usr/lib/{triplet}")
+		}
 	} else {
 		library_path += ":/usr/local/lib64:/usr/lib64:/lib64";
-		#[cfg(target_arch = "x86_64")]
-		{ library_path += ":/usr/lib/x86_64-linux-gnu" }
-		#[cfg(target_arch = "aarch64")]
-		{ library_path += ":/usr/lib/aarch64-linux-gnu" }
-		#[cfg(target_arch = "riscv64")]
-		{ library_path += ":/usr/lib/riscv64-linux-gnu" }
-		#[cfg(target_arch = "loongarch64")]
-		{ library_path += ":/usr/lib/loongarch64-linux-gnu" }
-		#[cfg(all(target_arch = "powerpc64", target_endian = "big"))]
-		{ library_path += ":/usr/lib/powerpc64-linux-gnu" }
-		#[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
-		{ library_path += ":/usr/lib/powerpc64le-linux-gnu" }
+		if let Some(triplet) = multiarch_triplet() {
+			library_path += &format!(":/usr/lib/{triplet}")
+		}
 	}
 
 	let cache_library_path = get_ld_cache_dirs("/etc/ld.so.cache");

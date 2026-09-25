@@ -115,18 +115,9 @@ fn set_lib_env(
 						add_to_env("LIBVA_DRIVERS_PATH", "/run/opengl-driver/lib/dri");
 						add_to_env("LIBVA_DRIVERS_PATH", "/usr/lib/dri");
 						add_to_env("LIBVA_DRIVERS_PATH", "/usr/lib64/dri");
-						#[cfg(target_arch = "x86_64")]
-						add_to_env("LIBVA_DRIVERS_PATH", "/usr/lib/x86_64-linux-gnu/dri");
-						#[cfg(target_arch = "aarch64")]
-						add_to_env("LIBVA_DRIVERS_PATH", "/usr/lib/aarch64-linux-gnu/dri");
-						#[cfg(target_arch = "riscv64")]
-						add_to_env("LIBVA_DRIVERS_PATH", "/usr/lib/riscv64-linux-gnu/dri");
-						#[cfg(target_arch = "loongarch64")]
-						add_to_env("LIBVA_DRIVERS_PATH", "/usr/lib/loongarch64-linux-gnu/dri");
-						#[cfg(all(target_arch = "powerpc64", target_endian = "big"))]
-						add_to_env("LIBVA_DRIVERS_PATH", "/usr/lib/powerpc64-linux-gnu/dri");
-						#[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
-						add_to_env("LIBVA_DRIVERS_PATH", "/usr/lib/powerpc64le-linux-gnu/dri");
+						if let Some(triplet) = multiarch_triplet() {
+							add_to_env("LIBVA_DRIVERS_PATH", format!("/usr/lib/{triplet}/dri"))
+						}
 				}
 				add_to_env("LIBVA_DRIVERS_PATH", dir_path)
 			}
@@ -134,18 +125,9 @@ fn set_lib_env(
 				add_to_env("GBM_BACKENDS_PATH", "/run/opengl-driver/lib/gbm");
 				add_to_env("GBM_BACKENDS_PATH", "/usr/lib/gbm");
 				add_to_env("GBM_BACKENDS_PATH", "/usr/lib64/gbm");
-				#[cfg(target_arch = "x86_64")]
-				add_to_env("GBM_BACKENDS_PATH", "/usr/lib/x86_64-linux-gnu/gbm");
-				#[cfg(target_arch = "aarch64")]
-				add_to_env("GBM_BACKENDS_PATH", "/usr/lib/aarch64-linux-gnu/gbm");
-				#[cfg(target_arch = "riscv64")]
-				add_to_env("GBM_BACKENDS_PATH", "/usr/lib/riscv64-linux-gnu/gbm");
-				#[cfg(target_arch = "loongarch64")]
-				add_to_env("GBM_BACKENDS_PATH", "/usr/lib/loongarch64-linux-gnu/gbm");
-				#[cfg(all(target_arch = "powerpc64", target_endian = "big"))]
-				add_to_env("GBM_BACKENDS_PATH", "/usr/lib/powerpc64-linux-gnu/gbm");
-				#[cfg(all(target_arch = "powerpc64", target_endian = "little"))]
-				add_to_env("GBM_BACKENDS_PATH", "/usr/lib/powerpc64le-linux-gnu/gbm");
+				if let Some(triplet) = multiarch_triplet() {
+					add_to_env("GBM_BACKENDS_PATH", format!("/usr/lib/{triplet}/gbm"))
+				}
 				add_to_env("GBM_BACKENDS_PATH", dir_path)
 			}
 			if dir == "libheif" {

@@ -330,7 +330,7 @@ fn set_lib_env(
 // So we have to fix this issue in two ways:
 // * If the pipewire alsa plugin is NOT bundled, use the bundled alsa config.
 // * If the pipewire alsa plugin IS bundled, always use the host alsa config,
-//   this way we prevent the reverse issue of making using the pipewire plugin
+//   this way we prevent the reverse issue of alsa using the pipewire plugin
 //   on systems that do not have pipewire-alsa at all and would fail to work.
 fn is_alsa_plugin_bundled(library_path: &str, plugin: &str) -> bool {
 	Path::new(&format!("{library_path}/alsa-lib")).read_dir().is_ok_and(|entries| {

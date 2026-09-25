@@ -322,13 +322,16 @@ fn set_lib_env(
 	lib_path_data
 }
 
-// When pipewire is not deployed there is no libasound_module_pcm_pipewire.so,
-// so a host config that selects the pipewire plugin (pipewire-alsa installs
-// e.g. /etc/alsa/conf.d/99-pipewire-default.conf) cannot work. Fall back to
-// the bundled alsa.conf, which makes the bundled 99-pulseaudio-default.conf
-// the default PCM. When pipewire is deployed the host config is kept: the
-// build container's /usr/share/alsa/alsa.conf.d may hold a pipewire default
-// that must not become the default on a host without a running pipewire.
+// When pipewire is not deployed there is no libasound_module_pcm_pipewire.so
+// This means that if the host config defaults to pipewire-alsa
+// which is very common on systems that have pipewire, the appimage will try
+// to dlopen libasound_module_pcm_pipewire.so and fail.
+//
+// So we have to fix this issue in two ways:
+// * If the pipewire alsa plugin is NOT bundled, use the bundled alsa config.
+// * If the pipewire alsa plugin IS bundled, always use the host alsa config,
+//   this way we prevent the reverse issue of making using the pipewire plugin 
+//   on systems that do not have pipewire-alsa at all and would fail to work.
 fn bundle_deploys_alsa_plugin(library_path: &str, plugin: &str) -> bool {
 	Path::new(&format!("{library_path}/alsa-lib")).read_dir().is_ok_and(|entries| {
 		entries.flatten().any(|entry| {

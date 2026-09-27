@@ -6,14 +6,24 @@
  *   a different class in wayland than in x11, breaking desktop
  *   integration of appimages.
  *
+ * - gi_repository_require_private() and its g_irepository_require_private()
+ *   predecessor only ever search the private directory they are given.
+ *   Remap a /usr prefix to $APPDIR before the lookup, so the typelibs
+ *   bundled in the appimage are found instead of the host ones, and fall
+ *   back to the normal repository search path (GI_TYPELIB_PATH) after that.
+ *
  * USAGE:
  *   GTK_WINDOW_CLASS=fuck.gnome LD_PRELOAD=./gtk-fix-nonsense.so /path/to/app
+ *
+ *   GTK_FIX_NONSENSE_DEBUG=1 logs every require_private lookup served by
+ *   the typelib search path fallback.
 */
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ------------------------------------------------------------------ */
 /*  Real symbol resolution                                            */
@@ -50,20 +60,44 @@ static void *glib_handle(void) {
 }
 
 /*
- * Find the real symbol for a wrapper. Unresolved slots are retried on
- * every call, the gtk/glib stack may not be loaded yet when we get
- * preloaded.
+ * girepository is not a dependency of gtk and may be dlopened on its
+ * own, so it needs its own handle instead of piggybacking on the first
+ * gtk/glib library that happens to be loaded.
  */
-static void *real_sym(void *slot[static 1], const char *name) {
+static void *gir_handle(void) {
+	static void *cache;
+	static const char *sonames[] = {
+		"libgirepository-2.0.so.0",
+		"libgirepository-1.0.so.1",
+		NULL
+	};
+	return loaded_handle(&cache, sonames);
+}
+
+/*
+ * Find the real symbol for a wrapper. Unresolved slots are retried on
+ * every call, the gtk/glib/girepository stack may not be loaded yet
+ * when we get preloaded.
+ */
+static void *real_sym_with(void *slot[static 1], const char *name,
+		void *(*get_handle)(void)) {
 	if (!*slot) {
 		*slot = dlsym(RTLD_NEXT, name);
 		if (!*slot) {
-			void *handle = glib_handle();
+			void *handle = get_handle();
 			if (handle)
 				*slot = dlsym(handle, name);
 		}
 	}
 	return *slot;
+}
+
+static void *real_sym(void *slot[static 1], const char *name) {
+	return real_sym_with(slot, name, glib_handle);
+}
+
+static void *real_gir_sym(void *slot[static 1], const char *name) {
+	return real_sym_with(slot, name, gir_handle);
 }
 
 /* ------------------------------------------------------------------ */
@@ -180,6 +214,143 @@ void gdk_window_set_app_id(void *window, const char *app_id) {
 		real_sym(&real_gdk_window_set_app_id, "gdk_window_set_app_id");
 	if (real)
 		real(window, effective_id(app_id));
+}
+
+/* ------------------------------------------------------------------ */
+/*  GObject Introspection private typelib fallback                    */
+/* ------------------------------------------------------------------ */
+
+typedef struct _GIRepository GIRepository;
+typedef struct _GITypelib GITypelib;
+typedef struct _GError GError;
+
+typedef GITypelib *(*require_private_fn)(GIRepository *, const char *, const char *,
+	const char *, unsigned int, GError **);
+typedef GITypelib *(*require_fn)(GIRepository *, const char *, const char *,
+	unsigned int, GError **);
+
+/*
+ * g_set_error() refuses to overwrite an already set GError, so the one
+ * from the failed private lookup has to be cleared before retrying.
+ */
+static void clear_gi_error(GError **error) {
+	static void *real_g_clear_error;
+	void (*clear)(GError **) =
+		(void (*)(GError **))
+		real_sym(&real_g_clear_error, "g_clear_error");
+	if (clear)
+		clear(error);
+}
+
+/*
+ * The private directory comes from a compiled-in libdir like
+ * /usr/lib/xed/girepository-1.0. The appimage keeps the same layout under
+ * $APPDIR without the /usr prefix ($APPDIR/lib, $APPDIR/bin, ...), so
+ * remap /usr there and never touch the host path: a host typelib loaded
+ * next to a bundled library is asking for a crash. Returns a malloc'd
+ * string, or NULL when there is nothing to remap.
+ */
+static char *remap_typelib_dir(const char *dir) {
+	const char *appdir = getenv("APPDIR");
+	const char *suffix;
+	size_t len;
+	char *mapped;
+
+	if (!appdir || !*appdir || !dir)
+		return NULL;
+	if (strncmp(dir, "/usr/", 5) == 0)
+		suffix = dir + 4;
+	else if (strcmp(dir, "/usr") == 0)
+		suffix = "";
+	else
+		return NULL;
+
+	len = strlen(appdir) + strlen(suffix) + 1;
+	mapped = malloc(len);
+	if (!mapped)
+		return NULL;
+	snprintf(mapped, len, "%s%s", appdir, suffix);
+	return mapped;
+}
+
+/*
+ * Both gi_repository_require_private() (GLib >= 2.80) and its
+ * g_irepository_require_private() predecessor in libgirepository-1.0
+ * share the same logic but live in different libraries, so the real
+ * symbols and the two slots holding them are passed in.
+ */
+static int debug_enabled(void) {
+	static int cached = -1;
+	const char *v;
+
+	if (cached < 0) {
+		v = getenv("GTK_FIX_NONSENSE_DEBUG");
+		cached = v && strcmp(v, "1") == 0;
+	}
+	return cached;
+}
+
+static GITypelib *require_private_or_search_path(GIRepository *repository,
+	const char *typelib_dir, const char *namespace_, const char *version,
+	unsigned int flags, GError **error, void **real_private,
+	void **real_require, const char *private_sym, const char *fallback_sym)
+{
+	char *mapped;
+	GITypelib *typelib;
+
+	if (!*real_private)
+		*real_private = real_gir_sym(real_private, private_sym);
+	if (!*real_private)
+		return NULL;
+
+	mapped = remap_typelib_dir(typelib_dir);
+	typelib = ((require_private_fn) *real_private)(repository,
+		mapped ? mapped : typelib_dir, namespace_, version, flags, error);
+	free(mapped);
+	if (typelib)
+		return typelib;
+
+	/*
+	 * Resolve the fallback before clearing the error: a missing
+	 * fallback symbol must leave the caller with the private
+	 * lookup's GError instead of a cleared one.
+	 */
+	if (!*real_require)
+		*real_require = real_gir_sym(real_require, fallback_sym);
+	if (!*real_require)
+		return NULL;
+
+	clear_gi_error(error);
+	typelib = ((require_fn) *real_require)(repository, namespace_, version,
+		flags, error);
+	if (typelib && debug_enabled())
+		fprintf(stderr, " [gtk-fix-nonsense.so] Loaded '%s' "
+			"from the typelib search path\n", namespace_);
+	return typelib;
+}
+
+GITypelib *gi_repository_require_private(GIRepository *repository,
+	const char *typelib_dir, const char *namespace_, const char *version,
+	unsigned int flags, GError **error)
+{
+	static void *real_private;
+	static void *real_require;
+
+	return require_private_or_search_path(repository, typelib_dir,
+		namespace_, version, flags, error, &real_private, &real_require,
+		"gi_repository_require_private", "gi_repository_require");
+}
+
+GITypelib *g_irepository_require_private(GIRepository *repository,
+	const char *typelib_dir, const char *namespace_, const char *version,
+	unsigned int flags, GError **error)
+{
+	static void *real_private;
+	static void *real_require;
+
+	return require_private_or_search_path(repository, typelib_dir,
+		namespace_, version, flags, error, &real_private, &real_require,
+		"g_irepository_require_private", "g_irepository_require");
 }
 
 /* ------------------------------------------------------------------ */

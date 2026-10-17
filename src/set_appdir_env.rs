@@ -549,10 +549,9 @@ fn set_etc_env(sharun_dir: &str) {
 					let name = entry.file_name();
 					match name.to_str().unwrap_or_default() {
 						"fonts" => {
-							let fonts_conf = entry_path.join("fonts.conf");
-							if !Path::new("/etc/fonts/fonts.conf").exists() && fonts_conf.exists() {
-								env::set_var("FONTCONFIG_FILE", fonts_conf)
-							}
+							// the app gets its own copy of the host fontconfig
+							// configuration instead of using the host one as-is
+							set_fontconfig_env(&entry_path)
 						}
 						"ssl" => {
 							let openssl_conf = entry_path.join("openssl.cnf");
@@ -585,5 +584,433 @@ fn set_etc_env(sharun_dir: &str) {
 		} else {
 			eprintln!("WARNING: Cannot find CA Certificates in host!");
 		}
+	}
+}
+
+// A fontconfig cache is trusted as long as its checksum matches the mtime of the
+// directory it describes, and `FcCacheTimeValid()` also treats a mtime of 0 as
+// valid without looking at the checksum. ostree/bootc checkouts set every
+// directory mtime to 0, so a cache built while a font dir was empty stays valid
+// forever after fonts are installed into it, and the app sees no fonts at all.
+//
+// When that is detected the app gets its own copy of the host config with a
+// cache dir of its own, so the stale host cache is never read. Every other host
+// keeps using its config untouched, as do apps whose FONTCONFIG_FILE was
+// already set by the user, a launcher or the .env file.
+fn set_fontconfig_env(bundled_fonts_dir: &Path) {
+	set_fontconfig_env_from(bundled_fonts_dir, Path::new("/etc/fonts"))
+}
+
+fn set_fontconfig_env_from(bundled_fonts_dir: &Path, host_fonts_dir: &Path) {
+	if env::var_os("FONTCONFIG_FILE").is_some() {
+		return
+	}
+
+	let host_conf = host_fonts_dir.join("fonts.conf");
+
+	// no host configuration, so there is nothing to adapt
+	if !host_conf.exists() {
+		let fonts_conf = bundled_fonts_dir.join("fonts.conf");
+		if fonts_conf.exists() {
+			env::set_var("FONTCONFIG_FILE", fonts_conf)
+		}
+		return
+	}
+
+	// regular hosts have real mtimes, so they never had the problem and are
+	// left alone
+	let Ok(conf) = read_to_string(&host_conf) else {
+		eprintln!("WARNING: Cannot read '{}', using it as-is", host_conf.display());
+		return
+	};
+	if !has_zero_mtime_dir(&conf, host_fonts_dir) {
+		return
+	}
+
+	let patched = patch_config(&conf, host_fonts_dir);
+
+	// keep the copy in the app's own cache dir, never in the read-only bundle
+	let cache_home = get_env_var("XDG_CACHE_HOME");
+	let cache_home = if cache_home.is_empty() {
+		let home = get_env_var("HOME");
+		if home.is_empty() {
+			return
+		}
+		format!("{home}/.cache")
+	} else {
+		cache_home
+	};
+
+	let conf_path = PathBuf::from(cache_home).join("host-fontconfig.conf");
+	let Some(conf_dir) = conf_path.parent() else { return };
+
+	// writing it on every launch would be a pointless write, and it also keeps
+	// the app working when the cache dir is read-only
+	if std::fs::read_to_string(&conf_path).is_ok_and(|old| old == patched) {
+		env::set_var("FONTCONFIG_FILE", &conf_path);
+		return
+	}
+
+	// a config that is read while it is half written makes fontconfig fall back
+	// to its built-in defaults, so it is renamed into place instead
+	let tmp_path = conf_path.with_extension("conf.tmp");
+	let write_conf = || -> std::io::Result<()> {
+		std::fs::create_dir_all(conf_dir)?;
+		std::fs::write(&tmp_path, &patched)?;
+		std::fs::rename(&tmp_path, &conf_path)
+	};
+
+	// if the copy cannot be written the host config is still better than the
+	// bundled one, which does not match the host at all
+	match write_conf() {
+		Ok(()) => env::set_var("FONTCONFIG_FILE", &conf_path),
+		Err(err) => {
+			let _ = std::fs::remove_file(&tmp_path);
+			eprintln!("WARNING: Cannot write '{}': {err}, using the host config as-is", conf_path.display());
+		}
+	}
+}
+
+// A dir mtime of 0 is what makes fontconfig trust a cache regardless of its
+// contents, and is what ostree/bootc checkouts leave behind. Only the dirs of
+// the config itself are checked, a conf.d include can only be reached through
+// the host cache dirs which are dropped anyway.
+fn has_zero_mtime_dir(conf: &str, host_fonts_dir: &Path) -> bool {
+	conf.lines()
+		.filter_map(|line| {
+			let line = line.trim();
+			let dir = line.strip_prefix("<dir")?;
+			let dir = dir.strip_prefix('>')?;
+			Some(dir.strip_suffix("</dir>")?)
+		})
+		.any(|dir| {
+			let dir = dir.trim();
+			if dir.is_empty() || dir.contains("prefix=") {
+				return false
+			}
+			let path = if let Some(rest) = dir.strip_prefix('~') {
+				let home = get_env_var("HOME");
+				if home.is_empty() {
+					return false
+				}
+				PathBuf::from(format!("{home}{rest}"))
+			} else if dir.starts_with('/') {
+				PathBuf::from(dir)
+			} else {
+				host_fonts_dir.join(dir)
+			};
+			std::fs::metadata(&path)
+				.and_then(|meta| meta.modified())
+				.is_ok_and(|mtime| {
+					mtime.duration_since(std::time::UNIX_EPOCH).is_ok_and(|d| d.as_secs() == 0)
+				})
+		})
+}
+
+// Patches a host fontconfig config so it is safe to use from an app dir.
+//
+// Every <cachedir> is dropped, keeping only the xdg-relative ones since those
+// already point at the app's own cache dir, and every relative <include> is made
+// absolute against the host config dir. Includes are only ever looked up in
+// FONTCONFIG_PATH and never next to the config that includes them, so a relative
+// one would silently stop being loaded once the config lives elsewhere.
+//
+// Elements are matched as spans rather than as lines, so an element that is
+// split over several lines is still removed or rewritten as a whole.
+fn patch_config(conf: &str, host_fonts_dir: &Path) -> String {
+	let mut patched = String::with_capacity(conf.len());
+	let mut kept_dirs = 0;
+	let mut pos = 0;
+
+	while let Some((start, name)) = next_element(conf, pos) {
+		let Some(elem) = element_span(conf, start, name) else {
+			// not something that can be understood, so leave it as it is
+			break
+		};
+		let attrs = &conf[start + name.len() + 1..elem.open_end];
+		let inner = if elem.close_start > elem.open_end {
+			&conf[elem.open_end + 1..elem.close_start]
+		} else {
+			""
+		};
+
+		if name == "cachedir" && !is_xdg_prefixed(attrs) {
+			// when the element is alone on its line the whole line goes, so no
+			// blank or half indented line is left behind
+			let line_start = conf[..start].rfind('\n').map_or(0, |i| i + 1);
+			let after = &conf[elem.end..];
+			let line_end = after.find('\n');
+			let alone = conf[line_start..start].trim().is_empty() &&
+				line_end.is_none_or(|i| after[..i].trim().is_empty());
+			if alone {
+				if line_start >= pos {
+					patched.push_str(&conf[pos..line_start]);
+				}
+				pos = line_end.map_or(conf.len(), |i| elem.end + i + 1);
+			} else {
+				patched.push_str(&conf[pos..start]);
+				pos = elem.end;
+			}
+			continue
+		}
+
+		patched.push_str(&conf[pos..start]);
+
+		if name == "cachedir" {
+			patched.push_str(&conf[start..elem.end]);
+			kept_dirs += 1;
+		} else {
+			let path = inner.trim();
+			if is_xdg_prefixed(attrs) || path.is_empty() || path.starts_with('/') {
+				patched.push_str(&conf[start..elem.end]);
+			} else {
+				patched.push_str(&conf[start..elem.open_end + 1]);
+				patched.push_str(&host_fonts_dir.join(path).display().to_string());
+				patched.push_str(&conf[elem.close_start..elem.end]);
+			}
+		}
+		pos = elem.end
+	}
+
+	if pos < conf.len() {
+		patched.push_str(&conf[pos..])
+	}
+
+	// a config without any cache dir makes fontconfig use its built-in defaults,
+	// which are the host ones, so there must always be one left
+	if kept_dirs == 0 {
+		let insert_at = patched.find("</fontconfig>").unwrap_or(patched.len());
+		patched.insert_str(insert_at, "  <cachedir prefix=\"xdg\">fontconfig</cachedir>\n")
+	}
+
+	patched
+}
+
+struct ElementSpan {
+	open_end: usize,
+	close_start: usize,
+	end: usize,
+}
+
+// Finds the start of the next <cachedir> or <include> at or after `pos`.
+fn next_element(conf: &str, pos: usize) -> Option<(usize, &'static str)> {
+	["cachedir", "include"]
+		.iter()
+		.filter_map(|name| {
+			let tag = format!("<{name}");
+			conf[pos..]
+				.find(&tag)
+				.map(|i| (pos + i, *name))
+		})
+		.min_by_key(|(i, _)| *i)
+}
+
+// Returns the extent of the element starting at `start`, or None when it is not
+// a well formed one. Handles both `<x .../>` and `<x ...>...</x>`.
+fn element_span(conf: &str, start: usize, name: &str) -> Option<ElementSpan> {
+	let open_end = start + conf[start..].find('>')?;
+	if conf[start..=open_end].ends_with("/>") {
+		return Some(ElementSpan { open_end, close_start: open_end, end: open_end + 1 })
+	}
+	let close_tag = format!("</{name}>");
+	let close_start = open_end + 1 + conf[open_end + 1..].find(&close_tag)?;
+	Some(ElementSpan {
+		open_end,
+		close_start,
+		end: close_start + close_tag.len(),
+	})
+}
+
+// Matches both quote styles, and is used to leave xdg-relative entries alone.
+fn is_xdg_prefixed(attrs: &str) -> bool {
+	attrs.contains("prefix=\"xdg\"") || attrs.contains("prefix='xdg'")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{patch_config, set_fontconfig_env_from};
+	use std::{env, fs, path::PathBuf};
+
+	fn host_dir() -> PathBuf {
+		PathBuf::from("/etc/fonts")
+	}
+
+	fn fedora() -> &'static str {
+		"<?xml version=\"1.0\"?>\n<fontconfig>\n\t<dir>/usr/share/fonts</dir>\n\t<cachedir>/usr/lib/fontconfig/cache</cachedir>\n\t<cachedir prefix=\"xdg\">fontconfig</cachedir>\n\t<cachedir>~/.fontconfig</cachedir>\n\t<include ignore_missing=\"yes\">conf.d</include>\n</fontconfig>\n"
+	}
+
+	fn nixos() -> &'static str {
+		"<?xml version=\"1.0\"?>\n<fontconfig>\n  <dir>/nix/store/abc-fonts/share/fonts</dir>\n  <include>conf.d</include>\n</fontconfig>\n"
+	}
+
+	#[test]
+	fn drops_host_cache_dirs() {
+		let out = patch_config(fedora(), &host_dir());
+		assert!(!out.contains("/usr/lib/fontconfig/cache"));
+		assert!(!out.contains("~/.fontconfig"));
+		assert!(out.contains("<cachedir prefix=\"xdg\">fontconfig</cachedir>"));
+	}
+
+	#[test]
+	fn keeps_dirs_and_makes_includes_absolute() {
+		let out = patch_config(fedora(), &host_dir());
+		assert!(out.contains("<dir>/usr/share/fonts</dir>"));
+		assert!(out.contains("<include ignore_missing=\"yes\">/etc/fonts/conf.d</include>"));
+	}
+
+	#[test]
+	fn keeps_a_cache_dir_when_there_was_none() {
+		let conf = "<?xml version=\"1.0\"?>\n<fontconfig>\n<dir>/usr/share/fonts</dir>\n</fontconfig>\n";
+		let out = patch_config(conf, &host_dir());
+		assert!(out.contains("<cachedir prefix=\"xdg\">fontconfig</cachedir>"));
+		assert!(out.find("<cachedir").unwrap() < out.find("</fontconfig>").unwrap());
+	}
+
+	#[test]
+	fn drops_a_store_cache_dir_but_keeps_the_store_dirs() {
+		let out = patch_config(nixos(), &host_dir());
+		assert!(out.contains("/nix/store/abc-fonts/share/fonts"));
+		assert!(out.contains("<cachedir prefix=\"xdg\">fontconfig</cachedir>"));
+	}
+
+	#[test]
+	fn leaves_other_includes_alone() {
+		let conf = "<fontconfig>\n<include prefix=\"xdg\">fontconfig/conf.d</include>\n<include ignore_missing=\"yes\">/opt/fonts/conf.d</include>\n</fontconfig>\n";
+		let out = patch_config(conf, &host_dir());
+		assert!(out.contains("<include prefix=\"xdg\">fontconfig/conf.d</include>"));
+		assert!(out.contains("<include ignore_missing=\"yes\">/opt/fonts/conf.d</include>"));
+	}
+
+	// an element split over several lines must be removed as a whole, otherwise
+	// the leftover closing tag makes the whole config fail to parse
+	#[test]
+	fn drops_a_multiline_cache_dir() {
+		let conf = "<?xml version=\"1.0\"?>\n<fontconfig>\n  <dir>/usr/share/fonts</dir>\n  <cachedir>\n    /var/cache/fontconfig\n  </cachedir>\n</fontconfig>\n";
+		let out = patch_config(conf, &host_dir());
+		assert!(!out.contains("/var/cache/fontconfig"));
+		assert_eq!(out.matches("<cachedir").count(), 1, "{out}");
+		assert_eq!(out.matches("</cachedir>").count(), 1, "{out}");
+	}
+
+	#[test]
+	fn drops_a_cache_dir_on_a_shared_line() {
+		let conf = "<fontconfig>\n<dir>/usr/share/fonts</dir><cachedir>/var/cache/fontconfig</cachedir>\n</fontconfig>\n";
+		let out = patch_config(conf, &host_dir());
+		assert!(!out.contains("/var/cache/fontconfig"));
+		assert!(out.contains("<dir>/usr/share/fonts</dir>"));
+	}
+
+	#[test]
+	fn makes_a_multiline_include_absolute() {
+		let conf = "<fontconfig>\n<include ignore_missing=\"yes\">\n  conf.d\n</include>\n</fontconfig>\n";
+		let out = patch_config(conf, &host_dir());
+		assert!(out.contains(">/etc/fonts/conf.d</include>"), "{out}");
+	}
+
+	#[test]
+	fn single_quoted_xdg_prefix_is_kept() {
+		let conf = "<fontconfig>\n<cachedir prefix='xdg'>fontconfig</cachedir>\n</fontconfig>\n";
+		let out = patch_config(conf, &host_dir());
+		assert!(out.contains("<cachedir prefix='xdg'>fontconfig</cachedir>"));
+	}
+
+	fn tmp(name: &str) -> PathBuf {
+		let dir = env::temp_dir().join(format!("sharun-test-fonts-{name}"));
+		let _ = fs::remove_dir_all(&dir);
+		fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
+	fn write_host(root: &PathBuf) -> PathBuf {
+		let host = root.join("etc/fonts");
+		fs::create_dir_all(&host).unwrap();
+		fs::write(host.join("fonts.conf"), fedora()).unwrap();
+		host
+	}
+
+	// a dir with a real mtime never had the problem, so nothing is changed
+	#[test]
+	fn leaves_a_healthy_host_alone() {
+		let root = tmp("healthy");
+		let host = write_host(&root);
+		env::set_var("XDG_CACHE_HOME", &root);
+		env::remove_var("FONTCONFIG_FILE");
+
+		set_fontconfig_env_from(&root.join("bundled"), &host);
+
+		assert!(env::var_os("FONTCONFIG_FILE").is_none());
+		assert!(!root.join("host-fontconfig.conf").exists());
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	// an existing FONTCONFIG_FILE belongs to the user, the launcher or .env
+	#[test]
+	fn respects_an_existing_config() {
+		let root = tmp("existing");
+		let host = write_host(&root);
+		env::set_var("XDG_CACHE_HOME", &root);
+		env::set_var("FONTCONFIG_FILE", "/somewhere/else.conf");
+
+		set_fontconfig_env_from(&root.join("bundled"), &host);
+
+		assert_eq!(env::var("FONTCONFIG_FILE").unwrap(), "/somewhere/else.conf");
+		assert!(!root.join("host-fontconfig.conf").exists());
+
+		env::remove_var("FONTCONFIG_FILE");
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	// a dir with mtime 0 is the ostree/bootc case, so the copy is written
+	#[test]
+	fn writes_a_copy_when_a_dir_has_mtime_zero() {
+		let root = tmp("zero");
+		let fonts = root.join("fonts");
+		fs::create_dir_all(&fonts).unwrap();
+		let host = root.join("etc/fonts");
+		fs::create_dir_all(&host).unwrap();
+		fs::write(
+			host.join("fonts.conf"),
+			format!("<fontconfig>\n<dir>{}</dir>\n<cachedir>/var/cache/fontconfig</cachedir>\n</fontconfig>\n", fonts.display()),
+		)
+		.unwrap();
+		let mtime = std::time::SystemTime::UNIX_EPOCH;
+		std::fs::File::open(&fonts).unwrap().set_modified(mtime).unwrap();
+		let cache = root.join("cache");
+		env::set_var("XDG_CACHE_HOME", &cache);
+		env::remove_var("FONTCONFIG_FILE");
+
+		set_fontconfig_env_from(&root.join("bundled"), &host);
+
+		let conf = cache.join("host-fontconfig.conf");
+		assert_eq!(env::var("FONTCONFIG_FILE").unwrap(), conf.to_string_lossy());
+		let written = fs::read_to_string(&conf).unwrap();
+		assert!(!written.contains("/var/cache/fontconfig"));
+		assert!(written.contains("<cachedir prefix=\"xdg\">fontconfig</cachedir>"));
+		// no temp file is left behind
+		assert!(!cache.join("host-fontconfig.conf.tmp").exists());
+
+		env::remove_var("FONTCONFIG_FILE");
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	// no host config at all, so the bundled one is used like before
+	#[test]
+	fn falls_back_to_the_bundled_config() {
+		let root = tmp("bundled");
+		let bundled = root.join("bundled");
+		fs::create_dir_all(&bundled).unwrap();
+		fs::write(bundled.join("fonts.conf"), "<fontconfig/>").unwrap();
+		env::remove_var("FONTCONFIG_FILE");
+
+		set_fontconfig_env_from(&bundled, &root.join("etc/fonts"));
+
+		assert_eq!(
+			env::var("FONTCONFIG_FILE").unwrap(),
+			bundled.join("fonts.conf").to_string_lossy()
+		);
+
+		env::remove_var("FONTCONFIG_FILE");
+		fs::remove_dir_all(&root).unwrap();
 	}
 }

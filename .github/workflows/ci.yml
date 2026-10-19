@@ -102,6 +102,17 @@ jobs:
         if: matrix.arch == 'x86_64'
         run: sh tools/test-shell.sh shell/dash
 
+      # .cargo/config.toml pins the musl target and build-std for the release
+      # binary, and the tests do not build with that (duplicate lang item in
+      # core), so it is moved aside for this step. The memfd and tmpfile tests
+      # skip themselves when the runner cannot provide one.
+      - name: Unit tests
+        if: matrix.arch == 'x86_64'
+        run: |
+          mv .cargo/config.toml ./cargo-config.toml
+          trap 'mv ./cargo-config.toml .cargo/config.toml' EXIT
+          cargo test --release --target x86_64-unknown-linux-gnu
+
       - name: Build
         run: |
           export CARGO_TARGET_${{ matrix.env }}_LINKER="$RUNNER_TEMP/zigcc"

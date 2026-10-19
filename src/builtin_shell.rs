@@ -144,6 +144,66 @@ fn create_executable(path: &str) -> Result<File, Error> {
 	}
 }
 
+/// Runs one way of getting the shell executed: with a close-on-exec fd
+/// first, and again without it when the kernel says ENOENT.
+///
+/// ENOENT is the kernel refusing to hand a close-on-exec fd to an
+/// interpreter (see `memfd_with_shell`), so the fd flag is worth retrying
+/// without. Any other errno is not about the flag, so there is nothing to
+/// gain from a second attempt and the caller moves on to the next strategy.
+/// Returns the last error, or `None` if the list of strategies was empty.
+fn run_strategy<O, R>(
+	label: &str,
+	open: O,
+	run: &R,
+	errors: &mut Vec<String>,
+) -> Option<Error>
+where
+	O: Fn(bool) -> Result<File, Error>,
+	R: Fn(&File) -> Error,
+{
+	let mut last: Option<Error> = None;
+	for cloexec in [true, false] {
+		let err = match open(cloexec) {
+			Ok(file) => run(&file),
+			Err(err) => err,
+		};
+		errors.push(format!("{label}, cloexec={cloexec}: {err}"));
+		let retry = err.kind() == ErrorKind::NotFound;
+		last = Some(err);
+		if !retry {
+			break
+		}
+	}
+	last
+}
+
+/// Runs every way of getting the shell executed, in order, and returns the
+/// last error together with a record of everything that was tried.
+///
+/// Both strategies are always attempted. A memfd that exists but cannot be
+/// executed (EACCES from a policy that refuses to execute memfds, for
+/// example) has to fall through to the temporary file, so a non-ENOENT error
+/// only ends that one strategy, never the whole thing. The close-on-exec
+/// retry within a strategy is `run_strategy`.
+fn run_all_strategies<M, T, R>(memfd: M, tmpfile: T, run: &R) -> (Error, Vec<String>)
+where
+	M: Fn(bool) -> Result<File, Error>,
+	T: Fn(bool) -> Result<File, Error>,
+	R: Fn(&File) -> Error,
+{
+	let mut errors: Vec<String> = Vec::new();
+	let mut last_err = Error::new(ErrorKind::NotFound, "no way to run the embedded shell");
+	let mut keep = |err: Option<Error>| {
+		if let Some(err) = err {
+			last_err = err;
+		}
+	};
+	keep(run_strategy("memfd", memfd, run, &mut errors));
+	keep(run_strategy("temporary file", tmpfile, run, &mut errors));
+	(last_err, errors)
+}
+
 /// Replaces this process with the embedded shell running `script` with `args`.
 /// Only returns on failure, with the error.
 pub fn exec_script(script: &Path, args: &[String]) -> Error {
@@ -161,47 +221,11 @@ pub fn exec_script(script: &Path, args: &[String]) -> Error {
 	let mut argv_ptrs: Vec<*const nix::libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
 	argv_ptrs.push(std::ptr::null());
 
-	let mut errors: Vec<String> = Vec::new();
-	let mut last_err = Error::new(ErrorKind::NotFound, "no way to run the embedded shell");
-
-	// CLOEXEC first: when the shell is a native ELF the exec succeeds right
-	// away and no fd leaks. ENOENT means the kernel needed an interpreter and
-	// refused because of the close-on-exec fd, so try again without it.
-	for cloexec in [true, false] {
-		match memfd_with_shell(cloexec) {
-			Ok(file) => {
-				unsafe { nix::libc::fexecve(file.as_raw_fd(), argv_ptrs.as_ptr(), environ) };
-				let err = Error::last_os_error();
-				if err.kind() != ErrorKind::NotFound {
-					return err
-				}
-				errors.push(format!("memfd, cloexec={cloexec}: {err}"));
-				last_err = err;
-			}
-			Err(err) => {
-				errors.push(format!("memfd, cloexec={cloexec}: {err}"));
-				last_err = err;
-			}
-		}
-	}
-
-	for cloexec in [true, false] {
-		match tmpfile_with_shell(cloexec) {
-			Ok(file) => {
-				unsafe { nix::libc::fexecve(file.as_raw_fd(), argv_ptrs.as_ptr(), environ) };
-				let err = Error::last_os_error();
-				if err.kind() != ErrorKind::NotFound {
-					return err
-				}
-				errors.push(format!("temporary file, cloexec={cloexec}: {err}"));
-				last_err = err;
-			}
-			Err(err) => {
-				errors.push(format!("temporary file, cloexec={cloexec}: {err}"));
-				last_err = err;
-			}
-		}
-	}
+	let run = |file: &File| -> Error {
+		unsafe { nix::libc::fexecve(file.as_raw_fd(), argv_ptrs.as_ptr(), environ) };
+		Error::last_os_error()
+	};
+	let (last_err, errors) = run_all_strategies(memfd_with_shell, tmpfile_with_shell, &run);
 
 	Error::new(
 		last_err.kind(),
@@ -215,6 +239,7 @@ pub fn exec_script(script: &Path, args: &[String]) -> Error {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::io::{Read, Seek, SeekFrom};
 
 	fn is_close_on_exec(file: &File) -> bool {
 		let flags = unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_GETFD) };
@@ -222,11 +247,35 @@ mod tests {
 		flags & nix::libc::FD_CLOEXEC != 0
 	}
 
+	/// Some sandboxes deny memfd_create. Skipping is reported instead of
+	/// failing: a test that cannot run here is not a broken build.
+	fn memfd_or_skip(cloexec: bool) -> Option<File> {
+		match memfd_with_shell(cloexec) {
+			Ok(file) => Some(file),
+			Err(err) => {
+				eprintln!("skipping: memfd_create is not available here: {err}");
+				None
+			}
+		}
+	}
+
+	/// A noexec TMPDIR fails here for a reason that is not this code's
+	/// business either.
+	fn tmpfile_or_skip(cloexec: bool) -> Option<File> {
+		match tmpfile_with_shell(cloexec) {
+			Ok(file) => Some(file),
+			Err(err) => {
+				eprintln!("skipping: no usable temporary directory here: {err}");
+				None
+			}
+		}
+	}
+
 	// The shell is normally run with the fd close-on-exec so it does not leak
 	// into the shell and everything the shell starts.
 	#[test]
 	fn memfd_is_close_on_exec_when_asked() {
-		let file = memfd_with_shell(true).unwrap();
+		let Some(file) = memfd_or_skip(true) else { return };
 		assert!(is_close_on_exec(&file));
 	}
 
@@ -236,19 +285,19 @@ mod tests {
 	// to survive the exec, or the AppImage cannot start at all.
 	#[test]
 	fn memfd_keeps_the_fd_open_across_exec_when_asked() {
-		let file = memfd_with_shell(false).unwrap();
+		let Some(file) = memfd_or_skip(false) else { return };
 		assert!(!is_close_on_exec(&file));
 	}
 
 	#[test]
 	fn tmpfile_is_close_on_exec_when_asked() {
-		let file = tmpfile_with_shell(true).unwrap();
+		let Some(file) = tmpfile_or_skip(true) else { return };
 		assert!(is_close_on_exec(&file));
 	}
 
 	#[test]
 	fn tmpfile_keeps_the_fd_open_across_exec_when_asked() {
-		let file = tmpfile_with_shell(false).unwrap();
+		let Some(file) = tmpfile_or_skip(false) else { return };
 		assert!(!is_close_on_exec(&file));
 	}
 
@@ -256,13 +305,11 @@ mod tests {
 	// fd is read from position 0 because writing left it at the end.
 	#[test]
 	fn both_paths_hold_the_embedded_shell() {
-		use std::io::{Read, Seek, SeekFrom};
-
 		for cloexec in [true, false] {
-			for file in [
-				memfd_with_shell(cloexec).unwrap(),
-				tmpfile_with_shell(cloexec).unwrap(),
-			] {
+			let mut files: Vec<File> = Vec::new();
+			files.extend(memfd_or_skip(cloexec));
+			files.extend(tmpfile_or_skip(cloexec));
+			for file in files {
 				let mut f = &file;
 				f.seek(SeekFrom::Start(0)).unwrap();
 				let mut buf = Vec::new();
@@ -270,5 +317,95 @@ mod tests {
 				assert_eq!(buf, SHELL, "cloexec={cloexec}");
 			}
 		}
+	}
+
+	// A close-on-exec fd that needs an interpreter is refused with ENOENT, so
+	// the strategy has to be tried a second time without the flag. This is the
+	// qemu-user case, expressed as a plain error sequence.
+	#[test]
+	fn enoent_retries_without_cloexec() {
+		let mut errors = Vec::new();
+		let last = run_strategy(
+			"memfd",
+			|_| Ok(File::open("/dev/null").unwrap()),
+			&|_| Error::from_raw_os_error(nix::libc::ENOENT),
+			&mut errors,
+		);
+		assert_eq!(last.unwrap().kind(), ErrorKind::NotFound);
+		assert_eq!(errors.len(), 2, "both attempts have to be recorded");
+		assert!(errors[0].contains("cloexec=true"), "{}", errors[0]);
+		assert!(errors[1].contains("cloexec=false"), "{}", errors[1]);
+	}
+
+	// Any other errno is not about the fd flag, so the second attempt would
+	// only repeat it: one attempt, and the caller moves on to the temporary
+	// file instead of giving up.
+	#[test]
+	fn other_errors_do_not_retry() {
+		let mut errors = Vec::new();
+		let last = run_strategy(
+			"memfd",
+			|_| Ok(File::open("/dev/null").unwrap()),
+			&|_| Error::from_raw_os_error(nix::libc::EACCES),
+			&mut errors,
+		);
+		assert_eq!(last.unwrap().kind(), ErrorKind::PermissionDenied);
+		assert_eq!(errors.len(), 1, "a non-ENOENT errno is not retried");
+	}
+
+	// The two strategies are independent: a memfd that exists but cannot be
+	// executed (EACCES, e.g. a policy that refuses to execute memfds) has to
+	// let the temporary file have its turn. This is the regression the
+	// close-on-exec retry could introduce, so it is pinned here.
+	#[test]
+	fn a_failed_memfd_still_lets_the_temporary_file_run() {
+		let tried = std::cell::RefCell::new(Vec::new());
+		let (_last, errors) = run_all_strategies(
+			|_| Ok(File::open("/dev/null").unwrap()),
+			|_| Ok(File::open("/dev/null").unwrap()),
+			&|_| {
+				tried.borrow_mut().push("exec");
+				Error::from_raw_os_error(nix::libc::EACCES)
+			},
+		);
+		// one attempt per strategy: EACCES is not retried within a strategy
+		assert_eq!(tried.borrow().len(), 2, "both strategies have to run");
+		assert_eq!(errors.len(), 2, "{errors:?}");
+		assert!(errors[0].starts_with("memfd, "), "{}", errors[0]);
+		assert!(errors[1].starts_with("temporary file, "), "{}", errors[1]);
+	}
+
+	// The same with the two strategies failing differently, to show that the
+	// last error is what gets reported and the earlier one is not lost.
+	#[test]
+	fn the_message_lists_every_attempt() {
+		let (_last, errors) = run_all_strategies(
+			|_| Err(Error::from_raw_os_error(nix::libc::EPERM)),
+			|_| Err(Error::from_raw_os_error(nix::libc::EACCES)),
+			&|_| unreachable!("no fd was produced"),
+		);
+		assert_eq!(errors.len(), 2, "{errors:?}");
+		assert!(errors[0].starts_with("memfd, cloexec=true: "), "{}", errors[0]);
+		assert!(
+			errors[1].starts_with("temporary file, cloexec=true: "),
+			"{}",
+			errors[1]
+		);
+	}
+
+	// A strategy that cannot even produce an fd still records why, so the
+	// final message says what was tried.
+	#[test]
+	fn a_failed_open_is_recorded() {
+		let mut errors = Vec::new();
+		let last = run_strategy(
+			"memfd",
+			|_| Err(Error::from_raw_os_error(nix::libc::EPERM)),
+			&|_| unreachable!("nothing to run"),
+			&mut errors,
+		);
+		assert_eq!(last.unwrap().kind(), ErrorKind::PermissionDenied);
+		assert_eq!(errors.len(), 1);
+		assert!(errors[0].starts_with("memfd, cloexec=true: "), "{}", errors[0]);
 	}
 }

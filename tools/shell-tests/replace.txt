@@ -1,0 +1,463 @@
+? x=abcabc; printf '%s\n' ${x/b/Z}
+> aZcabc
+
+? x=abcabc; printf '%s\n' ${x//b/Z}
+> aZcaZc
+
+? x=abcabc; printf '%s\n' ${x/#a/Z}
+> Zbcabc
+
+? x=abcabc; printf '%s\n' ${x/%c/Z}
+> abcabZ
+
+? x=abcabc; printf '%s\n' ${x/#b/Z}
+> abcabc
+
+? x=abcabc; printf '%s\n' ${x/%b/Z}
+> abcabc
+
+? x=abcabc; printf '%s\n' ${x//b}
+> acac
+
+? x=abcabc; printf '%s\n' ${x/b}
+> acabc
+
+? x=abcabc; printf '%s\n' ${x//x/Z}
+> abcabc
+
+? x=abcabc; printf '%s\n' ${x//}
+> abcabc
+
+? x=abcabc; printf '%s\n' ${x//[ab]/-}
+> --c--c
+
+? x=abcabc; printf '%s\n' ${x//a*c/-}
+> -
+
+? x=abcabc; printf '%s\n' ${x/a*c/-}
+> -
+
+? x=abcabc; printf '%s\n' ${x//?/-}
+> ------
+
+? x=abcabc; printf '%s\n' ${x//b?/-}
+> a-a-
+
+? x=abcabc; printf '%s\n' ${x//*/-}
+> -
+
+? x=abcabc; printf '%s\n' ${x/%*/-}
+> -
+
+? x=abcabc; printf '%s\n' ${x/#*/-}
+> -
+
+? x=abcabc; printf '%s\n' ${x/#/Z}
+> Zabcabc
+
+? x=abcabc; printf '%s\n' ${x/%/Z}
+> abcabcZ
+
+? x=abcabc; printf '%s\n' ${x/#a/}
+> bcabc
+
+? x=; printf '%s\n' "[${x//a/b}]"
+> []
+
+? unset x; printf '%s\n' "[${x//a/b}]"
+> []
+
+? x=aaa; printf '%s\n' ${x//a/bb}
+> bbbbbb
+
+? x=aaa; printf '%s\n' ${x/a/bb}
+> bbaa
+
+? x=aaa; printf '%s\n' ${x//aa/b}
+> ba
+
+? x=/usr/local/bin; printf '%s\n' ${x//\//:}
+> :usr:local:bin
+
+? x=/usr/local/bin; printf '%s\n' ${x//"/"/:}
+> :usr:local:bin
+
+? x=/usr/local/bin; printf '%s\n' ${x//'/'/:}
+> :usr:local:bin
+
+? x=a/b/c; printf '%s\n' ${x////-}
+> a-b-c
+
+? x=a/b/c; printf '%s\n' ${x//\//\/}
+> a/b/c
+
+? x=a.b.c; printf '%s\n' ${x//./-}
+> a-b-c
+
+? x=a.b.c; printf '%s\n' ${x//"."/-}
+> a-b-c
+
+? x=a*b*c; printf '%s\n' ${x//\*/-}
+> a-b-c
+
+? x=a*b*c; printf '%s\n' ${x//"*"/-}
+> a-b-c
+
+? x=a*b*c; printf '%s\n' ${x//'*'/-}
+> a-b-c
+
+? x=a?b; printf '%s\n' ${x//\?/-}
+> a-b
+
+? x=a[b; printf '%s\n' ${x//\[/-}
+> a-b
+
+? x="a b c"; printf '%s\n' ${x// /_}
+> a_b_c
+
+? x="a b c"; printf '%s\n' "${x// /_}"
+> a_b_c
+
+? x="a b c"; printf '%s\n' "${x//b/ B }"
+> a  B  c
+
+? x="a b c"; printf '%s\n' ${x//b/ B }
+> a
+> B
+> c
+
+? x="a b c"; set -- ${x// /  }; printf '%s\n' $#
+> 3
+
+? x="a b c"; set -- "${x// /  }"; printf '%s\n' $#
+> 1
+
+? x=abc; y=b; printf '%s\n' ${x/$y/Z}
+> aZc
+
+? x=abc; y=b; printf '%s\n' ${x//$y/$y$y}
+> abbc
+
+? x=abc; y=b; printf '%s\n' "${x/"$y"/Z}"
+> aZc
+
+? x=abc; y='*'; printf '%s\n' ${x/$y/Z}
+> Z
+
+? x=abc; y='*'; printf '%s\n' ${x/"$y"/Z}
+> abc
+
+? x=abc; y=Z; printf '%s\n' ${x/b/${y}}
+> aZc
+
+? x=abc; printf '%s\n' ${x/b/$(printf '%s\n' Q)}
+> aQc
+
+? x=abc; printf '%s\n' ${x/b/`printf '%s\n' Q`}
+> aQc
+
+? x=abc; printf '%s\n' ${x/b/$((1+2))}
+> a3c
+
+? x=abc; printf '%s\n' ${x/$(printf '%s\n' b)/Z}
+> aZc
+
+? x=abc; printf '%s\n' ${x/b/${y:-dflt}}
+> adfltc
+
+? x=abc; printf '%s\n' ${x/b/${y:-a/b}}
+> aa/bc
+
+? x=abc; printf '%s\n' ${x/${y:-b}/Z}
+> aZc
+
+? x=abc; printf '%s\n' ${x/${y:-b/c}/Z}
+> abc
+
+? x=abc; printf '%s\n' ${x/b/\\}
+> a\c
+
+? x=abc; printf '%s\n' ${x/b/'\'}
+> a\c
+
+? x=abc; printf '%s\n' ${x/b/\$}
+> a$c
+
+? x=abc; printf '%s\n' ${x/b/"$"}
+> a$c
+
+? x=abc; printf '%s\n' ${x/b/&}
+> a&c
+
+? x=abc; printf '%s\n' ${x/b/\&}
+> a&c
+
+? x=abc; printf '%s\n' ${x//b/\n}
+> anc
+
+? x='a\b'; printf '%s\n' ${x//\\/-}
+> a-b
+
+? x='a\b'; printf '%s\n' ${x//'\'/-}
+> a-b
+
+? x='a"b'; printf '%s\n' ${x//\"/-}
+> a-b
+
+? x="a'b"; printf '%s\n' ${x//\'/-}
+> a-b
+
+? x="a'b"; printf '%s\n' ${x//"'"/-}
+> a-b
+
+? x='a$b'; printf '%s\n' ${x//\$/-}
+> a-b
+
+? x='a$b'; printf '%s\n' ${x//'$'/-}
+> a-b
+
+? x=a#b; printf '%s\n' ${x//#/-}
+> a-b
+
+? x=a#b; printf '%s\n' ${x//\#/-}
+> a-b
+
+? x=a#b; printf '%s\n' ${x/\#/-}
+> a-b
+
+? x=a%b; printf '%s\n' ${x//%/-}
+> a-b
+
+? x=a%b; printf '%s\n' ${x//\%/-}
+> a-b
+
+? x=abc; printf '%s\n' ${x/a/}
+> bc
+
+? x=abc; printf '%s\n' ${x/a/"" }
+> bc
+
+? x=abc; printf '%s\n' "${x/a/}"
+> bc
+
+? x=abc; printf '%s\n' "${x//b/}d"
+> acd
+
+? x=hello; printf '%s\n' ${x/l/L} ${x//l/L} ${x/%o/0} ${x/#h/H}
+> heLlo
+> heLLo
+> hell0
+> Hello
+
+? x=hello; printf '%s\n' ${x//[aeiou]/*}
+> h*ll*
+
+? x=hello; printf '%s\n' ${x//[!aeiou]/*}
+> *e**o
+
+? x=hello; printf '%s\n' ${x//[[:alpha:]]/*}
+> *****
+
+? x=hello; printf '%s\n' ${x//[a-m]/*}
+> ****o
+
+? x=hello; printf '%s\n' ${x/l*/L}
+> heL
+
+? x=hello; printf '%s\n' ${x/*l/L}
+> Lo
+
+? x=hello; printf '%s\n' ${x/l?/L}
+> heLo
+
+? x=hello; printf '%s\n' ${x//l*o/L}
+> heL
+
+? x=hello; printf '%s\n' ${x/%l*/L}
+> heL
+
+? x=hello; printf '%s\n' ${x/#*l/L}
+> Lo
+
+? x=hello; printf '%s\n' ${x/%??/L}
+> helL
+
+? x=hello; printf '%s\n' ${x/#??/L}
+> Lllo
+
+? x=hello; printf '%s\n' ${x/%hello/L}
+> L
+
+? x=hello; printf '%s\n' ${x/#hello/L}
+> L
+
+? x=hello; printf '%s\n' ${x/%hello1/L}
+> hello
+
+? x=hello; printf '%s\n' ${x//hello/L}
+> L
+
+? x=hello; printf '%s\n' ${x//hellos/L}
+> hello
+
+? x=hello; printf '%s\n' ${x/e/}${x/o/}
+> hllohell
+
+? x=a-b-c; IFS=-; printf '%s\n' ${x//-/ }; unset IFS
+> a b c
+
+? x=a-b-c; set -- ${x//-/ }; printf '%s\n' $#
+> 3
+
+? x=a-b-c; set -- "${x//-/ }"; printf '%s\n' $#
+> 1
+
+? x=a-b-c; for i in ${x//-/ }; do printf '%s\n' "[$i]"; done
+> [a]
+> [b]
+> [c]
+
+? set -- a b c; printf '%s\n' ${1/a/X} ${2//b/Y} ${3/%c/Z}
+> X
+> Y
+> Z
+
+? set -- ab cd; printf '%s\n' ${*/a/X}
+> Xb
+> cd
+
+? set -- ab cd; printf '%s\n' "${*//[bd]/X}"
+> aX cX
+
+? f() { printf '%s\n' ${1//a/b}; }; f banana
+> bbnbnb
+
+? f() { local x=$1; printf '%s\n' ${x//a/b}; }; f banana
+> bbnbnb
+
+? x=abc; printf '%s\n' ${#x} ${x#a} ${x%c} ${x/b/Z}
+> 3
+> bc
+> ab
+> aZc
+
+? x=abc; printf '%s\n' ${x:-def} ${x/b/Z} ${y:-${x/b/Z}}
+> abc
+> aZc
+> aZc
+
+? x=abc; y=${x//b/Z}; printf '%s\n' $y
+> aZc
+
+? x=abc; y="${x//b/Z}"; printf '%s\n' $y
+> aZc
+
+? x=abc; printf '%s\n' ${x//b/Z}${x//c/Y}
+> aZcabY
+
+? x=abc; printf '%s\n' ${x//b/${x//c/Q}}
+> aabQc
+
+? x=abc; printf '%s\n' ${x/${x/b/}/Z}
+> abc
+
+? x=abcabc; printf '%s\n' ${x//${x%c}/Z}
+> Zc
+
+? x=abc; case ${x/b/Z} in aZc) printf '%s\n' case-ok;; esac
+> case-ok
+
+? x=abc; [ "${x/b/Z}" = aZc ] && printf '%s\n' test-ok
+> test-ok
+
+? x=abc; printf '%s\n' ${x/b/Z}$((1+1))
+> aZc2
+
+? x='*'; printf '%s\n' ${x//\*/star}
+> star
+
+? x=; printf '%s\n' ${x/#/Z}; printf '%s\n' ${x/%/Z}; printf '%s\n' "${x/#/Z}"
+> Z
+> Z
+> Z
+
+? x=a; printf '%s\n' ${x/#a/Z} ${x/%a/Z} ${x/a/Z}
+> Z
+> Z
+> Z
+
+? x=ab; printf '%s\n' ${x/#?/Z} ${x/%?/Z}
+> Zb
+> aZ
+
+? set -u; q=; printf '%s\n' ${q//a/b}
+> 
+
+? x=abc; printf '%s\n' ${x/"b"/Z}
+> aZc
+
+? x=abc; printf '%s\n' ${x/'b'/Z}
+> aZc
+
+? x=abc; printf '%s\n' ${x/a"b"c/Z}
+> Z
+
+? x=abc; printf '%s\n' ${x/\a/Z}
+> Zbc
+
+? x=abc; printf '%s\n' ${x/\b\c/Z}
+> aZ
+
+? x=a*c; printf '%s\n' ${x/a*c/Z}
+> Z
+
+? x=a*c; printf '%s\n' ${x/a"*"c/Z}
+> Z
+
+? x=abc; printf '%s\n' ${x/a"*"c/Z}
+> abc
+
+? x=abcd; printf '%s\n' ${x/b[c-d]/Z}
+> aZd
+
+? x=abcd; printf '%s\n' ${x/b[]c]/Z}
+> aZd
+
+? x=ab]d; printf '%s\n' ${x/b[]]/Z}
+> aZd
+
+? x=ab-d; printf '%s\n' ${x//[a-]/Z}
+> ZbZd
+
+? x=a/b/c; printf '%s\n' ${x////-}
+> a-b-c
+
+? x=a/b/c; printf '%s\n' ${x///}
+> abc
+
+? x=a/b/c; printf '%s\n' ${x///-}
+> a/b/c
+
+? x=; printf '%s\n' "[${x/*/Z}]" "[${x//*/Z}]" "[${x/#/Z}]" "[${x/%/Z}]"
+> [Z]
+> [Z]
+> [Z]
+> [Z]
+
+? x=abc; p=b; printf '%s\n' "${x/$p/1}" "${x//"$p"/2}" ${x/b*/3} "${x/%?/4}" "${x/#?/5}"
+> a1c
+> a2c
+> a3
+> ab4
+> 5bc
+
+? x='a b'; set -- ${x// /  }; printf '%s\n' $#
+> 2
+
+? x='a b'; set -- "${x// /  }"; printf '%s\n' $#
+> 1
+
+? unset q; printf '%s\n' "[${q//a/b}]" "[${q:+${q/a/b}}]"
+> []
+> []
+

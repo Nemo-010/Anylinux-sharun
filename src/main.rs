@@ -10,6 +10,7 @@ use std::{
 mod utils;
 mod abi_note;
 mod apprun;
+mod builtin_shell;
 mod gio_launch_desktop;
 mod bwrap_wrapper;
 mod set_appdir_env;

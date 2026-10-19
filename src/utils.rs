@@ -162,26 +162,6 @@ pub fn which(executable: &str) -> Option<PathBuf> {
 	None
 }
 
-pub fn find_shell() -> Option<PathBuf> {
-	let candidates = [
-		PathBuf::from("/bin/sh"),
-		PathBuf::from("/bin/bash"),
-		PathBuf::from("/usr/bin/sh"),
-		PathBuf::from("/usr/bin/bash"),
-	];
-	for candidate in candidates {
-		if is_exe(&candidate) {
-			return Some(candidate);
-		}
-	}
-	for name in ["sh", "bash"] {
-		if let Some(path) = which(name) {
-			return Some(path);
-		}
-	}
-	None
-}
-
 pub fn is_script(path: &PathBuf) -> Result<bool> {
 	let mut file = File::open(path)?;
 	let mut buffer = [0; 2];

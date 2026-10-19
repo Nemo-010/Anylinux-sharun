@@ -1,0 +1,374 @@
+diff -ruN a/src/expand.c b/src/expand.c
+--- a/src/expand.c	2026-06-13 12:08:11.000000000 +0000
++++ b/src/expand.c	2026-10-19 12:57:56.054268122 +0000
+@@ -283,6 +283,18 @@
+ 		CTLENDARI,
+ 		0
+ 	};
++	static const char slashchars[] = {
++		CTLQUOTEMARK,
++		CTLENDVAR,
++		CTLESC,
++		CTLVAR,
++		CTLBACKQ,
++		CTLMBCHAR,
++		CTLARI,
++		CTLENDARI,
++		'/',
++		0
++	};
+ 	const char *reject = spclchars;
+ 	int c;
+ 	int breakall = (flag & (EXP_WORD | EXP_QUOTED)) == EXP_WORD;
+@@ -292,6 +304,8 @@
+ 
+ 	reject += !!(flag & EXP_VARTILDE2);
+ 	reject += flag & EXP_VARTILDE ? 0 : 2;
++	if (flag & EXP_STOPSLASH)
++		reject = slashchars;
+ 	inquotes = 0;
+ 	length = 0;
+ 	if (flag & EXP_TILDE) {
+@@ -318,6 +332,9 @@
+ 			length++;
+ 			/* c == '\0' || c == CTLENDARI || c == CTLENDVAR */
+ 			end = !!((c - 1) & 0x80);
++			/* an unquoted / ends the pattern of ${var/pat/str} */
++			if (c == '/' && !inquotes)
++				end = 1;
+ 		}
+ 		if (length > 0 && !(flag & EXP_DISCARD)) {
+ 			int newloc;
+@@ -352,10 +369,14 @@
+ 				goto tilde;
+ 			}
+ 			continue;
++		case '/':
++			/* a quoted / in the pattern of ${var/pat/str} */
++			p--;
++			continue;
+ 		case CTLQUOTEMARK:
+ 			/* "$@" syntax adherence hack */
+ 			if (!inquotes && !strcmp(p, dolatstr + 1)) {
+-				p = evalvar(p + 1, flag | EXP_QUOTED) + 1;
++				p = evalvar(p + 1, (flag & ~EXP_STOPSLASH) | EXP_QUOTED) + 1;
+ 				goto start;
+ 			}
+ 			inquotes ^= EXP_QUOTED;
+@@ -388,13 +409,13 @@
+ 			length++;
+ 			goto addquote;
+ 		case CTLVAR:
+-			p = evalvar(p, flag | inquotes);
++			p = evalvar(p, (flag & ~EXP_STOPSLASH) | inquotes);
+ 			goto start;
+ 		case CTLBACKQ:
+-			expbackq(argbackq->n, flag | inquotes);
++			expbackq(argbackq->n, (flag & ~EXP_STOPSLASH) | inquotes);
+ 			goto start;
+ 		case CTLARI:
+-			p = expari(p, flag | inquotes);
++			p = expari(p, (flag & ~EXP_STOPSLASH) | inquotes);
+ 			goto start;
+ 		}
+ 	}
+@@ -773,6 +794,199 @@
+ 
+ 
+ /*
++ * Append n bytes of the string on the stack, starting at offset from, to the
++ * string on the stack. The stack may move when it grows, so no pointer into
++ * it is kept across this.
++ */
++static void replcopy(int from, int n)
++{
++	char *q;
++
++	if (n <= 0)
++		return;
++	q = makestrspace(n, expdest);
++	memmove(q, (char *)stackblock() + from, n);
++	expdest = q + n;
++}
++
++/*
++ * ${var/pat/str}, ${var//pat/str}, ${var/#pat/str} and ${var/%pat/str}.
++ *
++ * The value of var is on the stack from startloc, followed by a NUL, and
++ * the pattern comes right after it at patloc. The pattern is expanded like
++ * the one of ${var#pat}, str is expanded to plain text and put after the
++ * pattern. The result is built after that and moved over the value.
++ * The longest match is replaced, as bash does.
++ */
++static char *subevalrepl(char *start, int patloc, int startloc,
++			 int varflags, int flag)
++{
++	int subtype = varflags & VSTYPE;
++	int anchored = subtype == VSREPLACEBEG || subtype == VSREPLACEEND;
++	int literal;
++	int hasrepl;
++	int prefilter;
++	int strloc;
++	int repoff;
++	int resoff;
++	int endoff;
++	int cursor;
++	int off;
++	size_t replen;
++	char *repl;
++	char *loc;
++	char *str;
++	char *p;
++	int c0;
++
++	p = argstr(start, (flag & EXP_DISCARD) | EXP_TILDE | EXP_CASE |
++			  EXP_STOPSLASH);
++	hasrepl = p[-1] == '/';
++	if (flag & EXP_DISCARD) {
++		if (hasrepl)
++			p = argstr(p, EXP_DISCARD);
++		return p;
++	}
++
++	if (hasrepl && subtype == VSREPLACEALL && p == start + 1) {
++		/* bash: in ${var///str} the first / is part of the pattern */
++		expdest--;
++		STPUTC('/', expdest);
++		p = argstr(p, EXP_TILDE | EXP_CASE | EXP_STOPSLASH);
++		hasrepl = p[-1] == '/';
++	}
++
++	if (FNMATCH_IS_ENABLED)
++		sh_error("pattern substitution needs a build without "
++			 "--enable-fnmatch");
++
++	/* the pattern is converted in place, it stays at patloc */
++	str = preglob((char *)stackblock() + patloc, 0);
++	strloc = str - (char *)stackblock();
++
++	repoff = expdest - (char *)stackblock();
++	if (hasrepl)
++		p = argstr(p, 0);
++	replen = expdest - (char *)stackblock() - repoff;
++	if (hasrepl && replen)
++		replen--;	/* the NUL that ends it */
++	else
++		replen = 0;
++
++	INTOFF;
++	repl = ckmalloc(replen + 1);
++	INTON;
++	memcpy(repl, (char *)stackblock() + repoff, replen);
++	repl[replen] = '\0';
++
++	/* a pattern with no wildcard matches one length only */
++	c0 = (signed char)*str;
++	literal = !strpbrk(str, "*?[");
++	prefilter = c0 > 0 && !strchr("*?[\\", c0);
++
++	endoff = patloc - 1;
++	resoff = expdest - (char *)stackblock();
++	cursor = startloc;
++	off = startloc;
++
++	/* an empty pattern matches nothing, unless it is anchored */
++	if (*str == '\0' && !anchored)
++		goto copyrest;
++
++	for (;;) {
++		int bestend = -1;
++		unsigned mb;
++		char *q;
++
++		str = (char *)stackblock() + strloc;
++		q = (char *)stackblock() + off;
++
++		if (subtype == VSREPLACEEND) {
++			/* the longest match that reaches the end */
++			if (pmatch(str, q))
++				bestend = endoff;
++		} else {
++			int ok = 1;
++
++			if (prefilter) {
++				const char *r = q;
++
++				mb = mbnext(r);
++				r += mb & 0xff;
++				ok = *r == c0;
++			}
++			if (ok) {
++				int eoff = off;
++
++				for (;;) {
++					char *t = (char *)stackblock() + eoff;
++					char c = *t;
++
++					*t = '\0';
++					ok = pmatch(str, (char *)stackblock() + off);
++					*t = c;
++					if (ok && (eoff > off || anchored ||
++						   endoff == startloc)) {
++						bestend = eoff;
++						if (literal)
++							break;
++					}
++					if (eoff >= endoff)
++						break;
++					mb = mbnext((char *)stackblock() + eoff);
++					eoff += (mb & 0xff) + (mb >> 8);
++					if (eoff > endoff)
++						eoff = endoff;
++				}
++			}
++		}
++
++		if (bestend >= 0) {
++			replcopy(cursor, off - cursor);
++			if (replen)
++				memtodest(repl, replen, flag);
++			cursor = bestend;
++			off = bestend;
++			if (subtype != VSREPLACEALL)
++				break;
++			if (off >= endoff)
++				break;
++			continue;
++		}
++
++		if (subtype == VSREPLACEBEG || off >= endoff)
++			break;
++		mb = mbnext((char *)stackblock() + off);
++		off += (mb & 0xff) + (mb >> 8);
++		if (off > endoff)
++			off = endoff;
++	}
++
++copyrest:
++	replcopy(cursor, endoff - cursor);
++
++	INTOFF;
++	ckfree(repl);
++	INTON;
++
++	{
++		size_t rlen = expdest - (char *)stackblock() - resoff;
++
++		loc = (char *)stackblock() + startloc;
++		memmove(loc, (char *)stackblock() + resoff, rlen);
++		loc += rlen;
++	}
++	*loc = '\0';
++	STADJUST(loc - expdest, expdest);
++
++	/* Remove any recorded regions beyond start of variable */
++	removerecordregions(startloc);
++
++	return p;
++}
++
++
++/*
+  * Expand a variable, and return a pointer to the next character in the
+  * input string.
+  */
+@@ -803,6 +1017,10 @@
+ 	case VSTRIMLEFTMAX:
+ 	case VSTRIMRIGHT:
+ 	case VSTRIMRIGHTMAX:
++	case VSREPLACE:
++	case VSREPLACEALL:
++	case VSREPLACEBEG:
++	case VSREPLACEEND:
+ 		mbchar = EXP_MBCHAR;
+ 		break;
+ 	}
+@@ -859,6 +1077,10 @@
+ 	case VSTRIMLEFTMAX:
+ 	case VSTRIMRIGHT:
+ 	case VSTRIMRIGHTMAX:
++	case VSREPLACE:
++	case VSREPLACEALL:
++	case VSREPLACEBEG:
++	case VSREPLACEEND:
+ 		break;
+ 	default:
+ 		abort();
+@@ -875,7 +1097,10 @@
+ 	}
+ 
+ 	patloc = expdest - (char *)stackblock();
+-	p = subevalvar(p, NULL, patloc, startloc, varflags, flag);
++	if (subtype >= VSREPLACE)
++		p = subevalrepl(p, patloc, startloc, varflags, flag | mbchar);
++	else
++		p = subevalvar(p, NULL, patloc, startloc, varflags, flag);
+ 
+ record:
+ 	if ((flag | discard) & EXP_DISCARD)
+diff -ruN a/src/expand.h b/src/expand.h
+--- a/src/expand.h	2026-06-13 12:08:11.000000000 +0000
++++ b/src/expand.h	2026-10-19 12:51:36.984289799 +0000
+@@ -61,6 +61,7 @@
+ #define EXP_QUOTED	0x100	/* expand word in double quotes */
+ #define EXP_KEEPNUL	0x200	/* do not skip NUL characters */
+ #define EXP_DISCARD	0x400	/* discard result of expansion */
++#define EXP_STOPSLASH	0x800	/* stop at an unquoted / (${var/pat/str}) */
+ 
+ 
+ struct jmploc;
+diff -ruN a/src/jobs.c b/src/jobs.c
+--- a/src/jobs.c	2026-06-13 01:49:51.000000000 +0000
++++ b/src/jobs.c	2026-10-19 12:50:35.726293302 +0000
+@@ -1449,7 +1449,7 @@
+ 	int quoted = 0;
+ 	static const char vstype[VSTYPE + 1][4] = {
+ 		"", "}", "-", "+", "?", "=",
+-		"%", "%%", "#", "##",
++		"%", "%%", "#", "##", "", "/", "//", "/#", "/%",
+ 	};
+ 
+ 	nextc = makestrspace((strlen(s) + 1) * 8, cmdnextc);
+diff -ruN a/src/parser.c b/src/parser.c
+--- a/src/parser.c	2026-06-13 01:50:04.000000000 +0000
++++ b/src/parser.c	2026-10-19 12:50:35.726293302 +0000
+@@ -1472,6 +1472,24 @@
+ 
+ 				newsyn = BASESYNTAX;
+ 				break;
++			case '/':
++				subtype = VSREPLACE;
++				c = pgetc_eatbnl();
++				if (c == '/')
++					subtype = VSREPLACEALL;
++				else if (c == '#')
++					subtype = VSREPLACEBEG;
++				else if (c == '%')
++					subtype = VSREPLACEEND;
++
++				if (subtype != VSREPLACE) {
++					if (chkeofmark)
++						STPUTC(c, out);
++				} else
++					pungetc();
++
++				newsyn = BASESYNTAX;
++				break;
+ 			}
+ 		} else {
+ 			if (subtype == VSLENGTH && c != '}')
+diff -ruN a/src/parser.h b/src/parser.h
+--- a/src/parser.h	2025-09-23 11:07:58.000000000 +0000
++++ b/src/parser.h	2026-10-19 12:50:35.726293302 +0000
+@@ -66,7 +66,10 @@
+ #define VSTRIMLEFT	0x8		/* ${var#pattern} */
+ #define VSTRIMLEFTMAX	0x9		/* ${var##pattern} */
+ #define VSLENGTH	0xa		/* ${#var} */
+-/* VSLENGTH must come last. */
++#define VSREPLACE	0xb		/* ${var/pattern/string} */
++#define VSREPLACEALL	0xc		/* ${var//pattern/string} */
++#define VSREPLACEBEG	0xd		/* ${var/#pattern/string} */
++#define VSREPLACEEND	0xe		/* ${var/%pattern/string} */
+ 
+ /* values of checkkwd variable */
+ #define CHKALIAS	0x1

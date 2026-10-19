@@ -88,6 +88,20 @@ jobs:
           } > "$RUNNER_TEMP/zigcc"
           chmod +x "$RUNNER_TEMP/zigcc"
 
+      # sharun embeds this shell to run AppRun.sh, it must exist before cargo
+      # build (include_bytes!). Needs the zig the linker wrapper already uses
+      - name: Build embedded shell
+        run: |
+          export ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/zig-cache"
+          export ZIG_LOCAL_CACHE_DIR="$RUNNER_TEMP/zig-cache"
+          sh tools/build-dash.sh "$RUNNER_TEMP/zig/zig" ${{ matrix.zigtarget }} shell/dash
+
+      # the shell has to do ${var/pat/str} like bash, the expected output of
+      # the cases comes from bash. Only the x86_64 build runs on the runner
+      - name: Test embedded shell
+        if: matrix.arch == 'x86_64'
+        run: sh tools/test-shell.sh shell/dash
+
       - name: Build
         run: |
           export CARGO_TARGET_${{ matrix.env }}_LINKER="$RUNNER_TEMP/zigcc"

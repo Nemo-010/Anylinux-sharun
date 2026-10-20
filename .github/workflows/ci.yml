@@ -188,11 +188,16 @@ jobs:
       # grab everything in one download without building on the host.
       # Flat layout on purpose, no nested directory and no leading ./
       # Files inside carry no arch, the tar name already has it
+      #
+      # dash is BSD-3-Clause, which asks for the notice to travel with binary
+      # redistribution, so it goes in the tar next to the binary. The name
+      # says which binary it belongs to, since the layout is flat.
       - name: Package
         run: |
           mkdir pkg
           cp "sharun-${{ matrix.arch }}" pkg/sharun
           cp "dash-${{ matrix.arch }}" pkg/dash
+          cp licenses/dash-COPYING pkg/dash-COPYING
           cp lib/*.so pkg/
           tar_name="sharun+helper-libs-${{ matrix.arch }}.tar"
           ( cd pkg && tar -cf "../$tar_name" -- * )

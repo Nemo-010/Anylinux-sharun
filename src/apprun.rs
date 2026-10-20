@@ -7,7 +7,7 @@ use std::{
 	os::unix::process::CommandExt,
 };
 
-use crate::utils::{is_file, basename, add_to_env, get_env_var};
+use crate::utils::{find_shell, is_file, basename, add_to_env, get_env_var};
 
 extern "C" {
 	fn getuid() -> u32;
@@ -62,7 +62,18 @@ pub fn run_as_apprun(
 
 	let apprun_wrapped = Path::new(sharun_dir).join("AppRun.sh");
 	if apprun_wrapped.exists() {
-		let err = crate::builtin_shell::exec_script(&apprun_wrapped, exec_args);
+		let shell = find_shell(sharun_dir).unwrap_or_else(|| {
+			eprintln!(
+				"Failed to find a shell for {}",
+				apprun_wrapped.display()
+			);
+			exit(1)
+		});
+
+		let err = Command::new(shell)
+			.arg(apprun_wrapped)
+			.args(exec_args)
+			.exec();
 		eprintln!("Failed to run AppRun.sh: {err}");
 		exit(1);
 	}

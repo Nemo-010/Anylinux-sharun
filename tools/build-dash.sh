@@ -1,9 +1,10 @@
 #!/bin/sh
 
-# Builds the static dash that sharun embeds to run AppRun.sh (src/builtin_shell.rs).
+# Builds the static dash that is shipped next to sharun. When sharun is the AppRun
+# and there is a `dash` in the sharun dir, AppRun.sh is run with it.
 #
 #   usage: build-dash.sh <zig> <zig target> <output>
-#   example: build-dash.sh zig x86_64-linux-musl shell/dash
+#   example: build-dash.sh zig x86_64-linux-musl dash-x86_64
 #
 # Needs make, git, curl, tar, gzip, sha512sum and a build host that runs x86_64
 # Linux binaries: dash generates its tables with helper programs that run
